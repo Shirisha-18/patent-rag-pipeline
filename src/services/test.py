@@ -1,333 +1,93 @@
-import os
-import csv
-import re
-import unicodedata
-from datetime import datetime
-from difflib import SequenceMatcher
+# test_patent_dates.py
 
+import re
 from dateparser import parse
 
-# =================================================
-# CONFIG
-# =================================================
+# ===============================
+# Step 1: Define test cases
+# ===============================
+test_patents = {
+    "1062464": """UNITED STATES PATENT OFFICE.
+HAROLD SHEMWELL, OF ASHEVILLE, NORTH CAROLINA, ASSIGNOR TO AMERICAN
+AUTOMATIC RAILWAY SWITCH COMPANY, A CORPORATION OF ALABAMA,
+AUTOMATIC SWITCH.
+998,644.
+Specification of Letters Patent.
+Application filed August 24, 1909, Serial No. 514,378.
+To all whom it may concern:
+Patented July 25, 1911.
+Renewed July 26, 1910. Serial No. 573,845.
+hereinafter more particularly described and""",
+    "1062161": """UNITED STATES PATENT OFFICE.
+1,062,161.
+ISIDOR KITSEE, OF PHILADELPHIA, PENNSYLVANIA.
+TELEPHONY.
+Specification of Letters Patent.
+Application filed March 16, 1907, Serial No. 362,714.
+To all whom it may concern:
+Be it known that I, ISIDOR KITSEE, citizen
+of the United States, residing at Philadel-
+phia, in the county of Philadelphia and
+5 State of Pennsylvania, have invented cer-
+tain new and useful Improvements in Tele-
+phony, of which the following is a specifi-
+cation.
+My invention relates to an improvement
+10 in telephony. Its object is, to provide means
+whereby, with the aid of one single circuit,
+one message may be transmitted from one
+terminal of said circuit simultaneously with
+the transmission of a message from the other
+15 terminal of said circuit.
+Patented May 20, 1913.
+Renewed July 19, 1912. Serial No. 710,487.
+85
+""",
+    "1063169": """UNITED STATES PATENT OFFICE.
+ALLEN DE VILBISS, JR., OF TOLEDO, OHIO, ASSIGNOR TO TOLEDO SCALE COMPANY, OF
+NEWARK, NEW JERSEY, A CORPORATION OF NEW JERSEY.
+1,063,169.
+SCALE.
+Specification of Letters Patent.
+Patented May 27, 1913.
+Application filed May 23, 1904, Serial No. 203,396. Renewed September 23, 1912. Serial No. 721,925
+To all whom it may concern:
+""",
+}
 
-OCR_ROOT = r"C:\Users\shiri\Dropbox\ocr_patents\ocr_patents\random_sample"
-REFERENCE_CSV = r"C:\Users\shiri\Dropbox\ocr_patents\patents_fyear_iyear.csv"
-OUTPUT_CSV = rf"C:\Users\shiri\Dropbox\ocr_patents\info\patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-# =================================================
-# HELPERS
-# =================================================
+# ===============================
+# Step 2: Define extraction function
+# ===============================
+def extract_issue_and_filing(text):
+    text = text.replace("\n", " ")  # flatten text
 
-
-def normalize_patnum(patnum):
-    """Normalize patent numbers ONLY for matching"""
-    return patnum.lstrip("0")
-
-
-def get_first_text_file(folder_path):
-    txt_files = [f for f in os.listdir(folder_path) if f.endswith("_text.txt")]
-    return sorted(txt_files)[0] if txt_files else None
-
-
-def split_date(date_str):
-    if not date_str:
-        return "", "", ""
-
-    dt = datetime.strptime(date_str, "%m/%d/%Y")
-    return str(dt.year), str(dt.month), str(dt.day)
-
-
-def normalize_text(text):
-    return "".join(
-        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    # Extract issue date (Patented)
+    patented_match = re.search(
+        r"Patented\s+([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})", text, re.I
     )
+    issue_date = ""
+    if patented_match:
+        dt = parse(patented_match.group(1))
+        if dt:
+            issue_date = dt.strftime("%m/%d/%Y")
+
+    # Extract filing date (Application filed)
+    filed_match = re.search(
+        r"Application filed\s+([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})", text, re.I
+    )
+    filing_date = ""
+    if filed_match:
+        dt = parse(filed_match.group(1))
+        if dt:
+            filing_date = dt.strftime("%m/%d/%Y")
+
+    return issue_date, filing_date
 
 
-def fuzzy_contains(line, target, threshold=0.72):
-    words = re.findall(r"[A-Za-z]{3,}", line.lower())
-    for word in words:
-        if SequenceMatcher(None, word, target).ratio() >= threshold:
-            return True
-    return False
-
-
-def extract_patent_dates(text):
-    text = normalize_text(text)
-    lines = text.splitlines()
-
-    # -------------------------------------------
-    # SMART MULTILINE MERGE (3-line window)
-    # -------------------------------------------
-    combined_lines = []
-
-    for i in range(len(lines)):
-        line = lines[i].strip()
-        if not line:
-            continue
-
-        combined_lines.append(line)
-
-        # Merge with next line
-        if i + 1 < len(lines):
-            combined_lines.append(line + " " + lines[i + 1].strip())
-
-        # Merge with next 2 lines
-        if i + 2 < len(lines):
-            combined_lines.append(
-                line + " " + lines[i + 1].strip() + " " + lines[i + 2].strip()
-            )
-
-    patent_date = ""
-    filed_date = ""
-
-    # -------------------------------------------
-    # STRONG DATE PATTERNS
-    # -------------------------------------------
-    flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2}[,\.]?\s+\d{4})"
-
-    patent_patterns = [
-        rf"patent\w*\s+{flexible_date}",
-        rf"patent\w*.*?{flexible_date}",
-        rf"letters patent.*?dated\s+{flexible_date}",
-        rf"dated\s+{flexible_date}",
-        rf"\(45\).*?{flexible_date}",
-        rf"\[45\].*?{flexible_date}",
-    ]
-
-    filed_patterns = [
-        rf"application.*?file\w*\s+{flexible_date}",
-        rf"file\w*\s+{flexible_date}",
-        rf"\(22\).*?{flexible_date}",
-        rf"\[22\].*?{flexible_date}",
-        rf"application\s+{flexible_date}",
-    ]
-
-    # -------------------------------------------
-    # PRIMARY EXTRACTION
-    # -------------------------------------------
-    for line in combined_lines:
-        if not patent_date:
-            for pat in patent_patterns:
-                m = re.search(pat, line, re.I)
-                if m:
-                    dt = parse(m.group(1))
-                    if dt:
-                        patent_date = dt.strftime("%m/%d/%Y")
-                        break
-
-        if not filed_date:
-            for pat in filed_patterns:
-                m = re.search(pat, line, re.I)
-                if m:
-                    dt = parse(m.group(1))
-                    if dt:
-                        filed_date = dt.strftime("%m/%d/%Y")
-                        break
-
-        if patent_date and filed_date:
-            break
-
-    # -------------------------------------------
-    # FUZZY RESCUE (Only if still missing)
-    # -------------------------------------------
-    if not patent_date or not filed_date:
-        for line in combined_lines:
-            m = re.search(flexible_date, line, re.I)
-            if not m:
-                continue
-
-            dt = parse(m.group(1))
-            if not dt:
-                continue
-
-            formatted = dt.strftime("%m/%d/%Y")
-            lower_line = line.lower()
-
-            # Filed detection
-            if not filed_date:
-                if (
-                    fuzzy_contains(lower_line, "filed")
-                    or fuzzy_contains(lower_line, "application")
-                    or "[22]" in line
-                    or "(22)" in line
-                ):
-                    filed_date = formatted
-                    continue
-
-            # Patent detection
-            if not patent_date:
-                if (
-                    fuzzy_contains(lower_line, "patented")
-                    or fuzzy_contains(lower_line, "issued")
-                    or "[45]" in line
-                    or "(45)" in line
-                ):
-                    patent_date = formatted
-                    continue
-
-            # Last resort positional logic
-            if not filed_date:
-                filed_date = formatted
-            elif not patent_date:
-                patent_date = formatted
-
-            if patent_date and filed_date:
-                break
-
-    # -------------------------------------------
-    # SANITY CHECK
-    # -------------------------------------------
-    if patent_date and filed_date:
-        if parse(filed_date) > parse(patent_date):
-            filed_date = ""
-
-    return patent_date, filed_date
-
-
-def load_csv_dict(path):
-    """Reference CSV keyed by normalized patent number"""
-    data = {}
-
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            key = normalize_patnum(row["patnum"])
-            data[key] = row
-
-    return data
-
-
-def compare_dates_with_flags(extracted_row, reference_row):
-    # -------------------------
-    # Missing patent entirely
-    # -------------------------
-    if not reference_row:
-        return "Missing", "Missing", "Missing in Reference"
-
-    # -------------------------
-    # PATENT (ISSUE) DATE
-    # -------------------------
-    if not (
-        reference_row.get("iyear")
-        and reference_row.get("imonth")
-        and reference_row.get("iday")
-    ):
-        patent_status = "Missing"
-    else:
-        patent_status = "No"
-        if (
-            extracted_row["iyear"] != reference_row["iyear"]
-            or extracted_row["imonth"] != reference_row["imonth"]
-            or extracted_row["iday"] != reference_row["iday"]
-        ):
-            patent_status = "Yes"
-
-    # -------------------------
-    # FILED (APPLICATION) DATE
-    # -------------------------
-    if not (
-        reference_row.get("fyear")
-        and reference_row.get("fmonth")
-        and reference_row.get("fday")
-    ):
-        filed_status = "Missing"
-    else:
-        filed_status = "No"
-        if (
-            extracted_row["fyear"] != reference_row["fyear"]
-            or extracted_row["fmonth"] != reference_row["fmonth"]
-            or extracted_row["fday"] != reference_row["fday"]
-        ):
-            filed_status = "Yes"
-
-    # -------------------------
-    # OVERALL FLAG
-    # -------------------------
-    if "Yes" in (patent_status, filed_status):
-        flag = "Wrong"
-    elif "Missing" in (patent_status, filed_status):
-        flag = "Missing"
-    else:
-        flag = "Correct"
-
-    return patent_status, filed_status, flag
-
-
-# =================================================
-# MAIN
-# =================================================
-
-
-def run():
-    extracted_rows = []
-
-    for folder in sorted(os.listdir(OCR_ROOT)):
-        folder_path = os.path.join(OCR_ROOT, folder)
-
-        if not os.path.isdir(folder_path):
-            continue
-
-        first_page = get_first_text_file(folder_path)
-        if not first_page:
-            continue
-
-        with open(
-            os.path.join(folder_path, first_page),
-            "r",
-            encoding="utf-8",
-            errors="ignore",
-        ) as f:
-            text = f.read()
-
-        patent_date, filed_date = extract_patent_dates(text)
-        pyear, pmonth, pday = split_date(patent_date)
-        fyear, fmonth, fday = split_date(filed_date)
-
-        extracted_rows.append(
-            {
-                "patnum": folder,
-                "iyear": pyear,
-                "imonth": pmonth,
-                "iday": pday,
-                "fyear": fyear,
-                "fmonth": fmonth,
-                "fday": fday,
-            }
-        )
-
-        print(
-            f"[OK] {folder} | "
-            f"Patent: {patent_date or 'N/A'} | "
-            f"Filed: {filed_date or 'N/A'}"
-        )
-
-    reference_dict = load_csv_dict(REFERENCE_CSV)
-
-    final_rows = []
-    for row in extracted_rows:
-        ref_row = reference_dict.get(normalize_patnum(row["patnum"]))
-        pw, fw, flag = compare_dates_with_flags(row, ref_row)
-        final_rows.append(
-            {
-                **row,
-                "patent_wrong": pw,
-                "filed_wrong": fw,
-                "flag": flag,
-            }
-        )
-
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=final_rows[0].keys())
-        writer.writeheader()
-        writer.writerows(final_rows)
-
-    print(f"\n✅ Done! Comparison CSV saved to:\n{OUTPUT_CSV}")
-
-
-# =================================================
-# ENTRY POINT
-# =================================================
-
-if __name__ == "__main__":
-    run()
+# ===============================
+# Step 3: Test the extraction
+# ===============================
+for patnum, text in test_patents.items():
+    issue, filed = extract_issue_and_filing(text)
+    print(f"{patnum} -> Issue: {issue}, Filed: {filed}")
