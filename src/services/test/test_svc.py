@@ -75,9 +75,65 @@ def safe_date(year, month, day):
 
 
 # =================================================
+# NEW FILTER HELPERS (SAFE ADDITIONS)
+# =================================================
+def is_likely_citation(line):
+    l = line.lower()
+    return (
+        "prior patent" in l
+        or "patent no" in l
+        or "u.s. patent" in l
+        or re.search(r"\bno\.\s*\d{3,}", l)
+    )
+
+
+def is_noise_line(line):
+    l = line.lower()
+    return (
+        "renewed" in l
+        or "reissue" in l
+        or "division" in l
+        or "divided" in l
+        or "continuation" in l
+        or "foreign" in l
+    )
+
+
+def is_true_filing_line(line):
+    l = line.lower()
+
+    # Strong signals
+    if "application filed" in l:
+        return True
+    if "[22]" in line or "(22)" in line:
+        return True
+
+    # Reject misleading contexts
+    if any(
+        x in l
+        for x in [
+            "original application",
+            "divided",
+            "division",
+            "continuation",
+            "parent",
+        ]
+    ):
+        return False
+
+    return "filed" in l
+
+
+def is_reference_section(line):
+    l = line.lower()
+    return "references cited" in l or "u.s. patents" in l or "foreign patents" in l
+
+
+# =================================================
 # PRIORITY DATE HANDLER
 # =================================================
 def resolve_priority_dates(text):
+
     priority_markers = [
         "[32]",
         "[30]",
@@ -94,6 +150,7 @@ def resolve_priority_dates(text):
         return None, None
 
     flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
+
     dates = []
 
     # Only scan header area to avoid citation dates
@@ -111,8 +168,8 @@ def resolve_priority_dates(text):
     if len(dates) < 3:
         return None, None
 
-    filing_dt = dates[1]
-    patent_dt = dates[-1]
+    filing_dt = min(dates)
+    patent_dt = max(dates)
 
     return (patent_dt.strftime("%m/%d/%Y"), filing_dt.strftime("%m/%d/%Y"))
 
@@ -125,10 +182,6 @@ def extract_patent_dates(text):
     lines = text.splitlines()
     combined_lines = []
 
-    # 🔵 ONLY HEADER (fix citations issue)
-    lines = lines[:120]
-
-    # 🔥 FIXED: refined invalid filing words
     invalid_filing_words = [
         "renewed",
         "renewal",
@@ -141,8 +194,6 @@ def extract_patent_dates(text):
         "continuation-in-part",
         "division",
         "divisional",
-        "divided",
-        "prior",
         "provisional",
         "pct",
         "international",
@@ -155,9 +206,6 @@ def extract_patent_dates(text):
         line = lines[i].strip()
         if not line:
             continue
-        if "renewed" in line.lower():
-            continue
-
         combined_lines.append(line)
         if i + 1 < len(lines):
             combined_lines.append(line + " " + lines[i + 1].strip())
@@ -171,113 +219,151 @@ def extract_patent_dates(text):
     flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
 
     patent_patterns = [
-        rf"(patent\w*|issued|letters patent).*?{flexible_date}",
+        rf"patent\w*\s+{flexible_date}",
+        rf"patent\w*.*?{flexible_date}",
+        rf"letters patent.*?dated\s+{flexible_date}",
+        rf"dated\s+{flexible_date}",
         rf"\(45\).*?{flexible_date}",
         rf"\[45\].*?{flexible_date}",
     ]
 
     filed_patterns = [
-        rf"(application.*file\w*|file\w*).*?{flexible_date}",
+        rf"application.*?file\w*\s+{flexible_date}",
+        rf"file\w*\s+{flexible_date}",
         rf"\(22\).*?{flexible_date}",
         rf"\[22\].*?{flexible_date}",
-        rf"original application.*?{flexible_date}",
+        rf"application\s+{flexible_date}",
     ]
 
-    # ================= PRIMARY =================
+    # ================= PRIMARY EXTRACTION =================
     for line in combined_lines:
         lower_line = line.lower()
 
-        # Issue date
+        if is_noise_line(line):
+            continue
+
+        if is_reference_section(line):
+            break
+
         if not patent_date:
             for pat in patent_patterns:
                 m = re.search(pat, line, re.I)
-                if m:
-                    try:
-                        dt = parse(m.group(m.lastindex))
-                    except Exception:
-                        continue
-                    if dt and dt.year >= 1800:
+                if m and not is_likely_citation(line):
+                    dt = parse(m.group(1))
+                    if dt:
                         patent_date = dt.strftime("%m/%d/%Y")
                         break
 
-        # Filing date
-        if not filed_date and not any(
-            word in lower_line for word in invalid_filing_words
-        ):
+        if not filed_date and is_true_filing_line(line):
             for pat in filed_patterns:
                 m = re.search(pat, line, re.I)
                 if m:
-                    try:
-                        dt = parse(m.group(m.lastindex))
-                    except Exception:
-                        continue
-                    if dt and dt.year >= 1800:
+                    dt = parse(m.group(1))
+                    if dt:
                         filed_date = dt.strftime("%m/%d/%Y")
                         break
 
         if patent_date and filed_date:
             break
 
-    # ================= FUZZY =================
+    # ================= FUZZY RESCUE =================
     if not patent_date or not filed_date:
         for line in combined_lines:
-            lower_line = line.lower()
-            if "renewed" in lower_line:
-                continue
-
             m = re.search(flexible_date, line, re.I)
             if not m:
                 continue
-            try:
-                dt = parse(m.group(1))
-            except Exception:
-                continue
-            if not dt or dt.year < 1800:
+
+            dt = parse(m.group(1))
+            if not dt:
                 continue
 
             formatted = dt.strftime("%m/%d/%Y")
+            lower_line = line.lower()
 
-            # Filing fuzzy
-            if not filed_date and (
-                fuzzy_contains(lower_line, "filed")
-                or fuzzy_contains(lower_line, "application")
-                or "[22]" in line
-                or "(22)" in line
+            if (
+                not filed_date
+                and is_true_filing_line(line)
+                and (
+                    fuzzy_contains(lower_line, "filed")
+                    or fuzzy_contains(lower_line, "application")
+                    or "[22]" in line
+                    or "(22)" in line
+                )
             ):
                 if not any(word in lower_line for word in invalid_filing_words):
                     filed_date = formatted
                     continue
 
-            # Patent fuzzy
-            if not patent_date and (
-                fuzzy_contains(lower_line, "patented")
-                or fuzzy_contains(lower_line, "issued")
-                or "[45]" in line
-                or "(45)" in line
+            if (
+                not patent_date
+                and not is_likely_citation(line)
+                and (
+                    fuzzy_contains(lower_line, "patented")
+                    or fuzzy_contains(lower_line, "issued")
+                    or "[45]" in line
+                    or "(45)" in line
+                )
             ):
-                patent_date = formatted
+                if "renewed" not in lower_line:
+                    patent_date = formatted
+                    continue
+
+    # ================= SECOND PASS (FIXED POSITION) =================
+    if not patent_date:
+        for i, line in enumerate(lines):
+            if i < 80:
                 continue
+            if "patented" in line.lower():
+                m = re.search(flexible_date, line, re.I)
+                if m:
+                    dt = parse(m.group(1))
+                    if dt:
+                        patent_date = dt.strftime("%m/%d/%Y")
+                        break
 
-    # 🔵 safer candidate refinement (header only)
-    all_candidates = find_alternate_dates("\n".join(lines))
-    for dt in all_candidates[::-1]:
-        if dt.year < 1800:
-            continue
+    # ================= MULTI-LINE FALLBACK =================
+    if not patent_date:
+        months = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ]
+        for i, line in enumerate(lines):
+            for month in months:
+                if month in line:
+                    day, year = None, None
+                    for j in range(1, 6):
+                        if i + j < len(lines):
+                            m_day = re.search(r"\b(\d{1,2})\b", lines[i + j])
+                            if m_day:
+                                day = m_day.group(1)
+                                for k in range(i + j + 1, min(i + j + 6, len(lines))):
+                                    m_year = re.search(r"\b(\d{4})\b", lines[k])
+                                    if m_year:
+                                        year = m_year.group(1)
+                                        break
+                                break
+                    if day and year:
+                        patent_date = f"{month} {day}, {year}"
+                        break
+            if patent_date:
+                break
 
-        dt_str = dt.strftime("%m/%d/%Y")
-        context_match = re.search(
-            rf"(patent\w*|issued|letters patent).*{dt.strftime('%B')}",
-            "\n".join(lines),
-            re.I,
-        )
-        if context_match:
-            patent_date = dt_str
-            break
-
-    # sanity check
+    # ================= SANITY CHECK =================
     if patent_date and filed_date:
         try:
-            if parse(filed_date) > parse(patent_date):
+            p = parse(patent_date)
+            f = parse(filed_date)
+            if f > p and abs((f - p).days) > 365:
                 filed_date = ""
         except:
             pass
@@ -403,14 +489,11 @@ def run():
         # ---- PRIORITY DATE FIX ----
         priority_patent, priority_filing = resolve_priority_dates(text)
 
-        patent_date, filed_date = extract_patent_dates(text)
-
         if priority_patent and priority_filing:
-            # ONLY use if extraction failed
-            if not patent_date or not filed_date:
-                patent_date = priority_patent
-                filed_date = priority_filing
-
+            patent_date = priority_patent
+            filed_date = priority_filing
+        else:
+            patent_date, filed_date = extract_patent_dates(text)
         pyear, pmonth, pday = split_date(patent_date)
         fyear, fmonth, fday = split_date(filed_date)
 
