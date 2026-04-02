@@ -51,6 +51,27 @@ These fields typically exist in structured XML formats in USPTO bulk datasets; h
 ### 4. Output Representation
 - Structured JSON-like patent representation generated from OCR output
 
+## 📁 Project Structure
+
+```
+├── LICENSE              <- MIT License for open-source usage
+├── README.md            <- Project documentation and usage guide
+├── requirements.txt     <- Python dependencies for the OCR pipeline
+├── .gitignore           <- Files and folders excluded from version control
+
+├── data/
+│   ├── raw/             <- Input TIFF patent images (USPTO / Google Patents)
+│   ├── processed/       <- OCR outputs and extracted structured data
+│   ├── external/        <- (Optional) external reference datasets if used
+│   ├── interim/         <- Intermediate OCR outputs before final processing
+
+├── src/
+│   └── services/
+│       ├── ocr/         <- Google Cloud Vision OCR extraction scripts
+│       ├── metadata/    <- Parsing and structuring OCR-extracted text
+│       ├── test/        <- Unit tests and validation scripts
+
+```
 
 ## Environment Setup
 
@@ -94,11 +115,11 @@ python src/google_cloud_vision.py
 4. Large-scale batch processing with **Google Cloud Storage**
 
 
-<!---
+<!--- 
 ## 📁 Project Structure
 
 ```
-├── LICENSE            <- Open-source license if one is chosen
+├── LICENSE            <- MIT License
 ├── README.md          <- The top-level README for developers using this project
 ├── data
 │   ├── external       <- Data from third party sources
@@ -141,6 +162,5 @@ python src/google_cloud_vision.py
     └── services                <- Service classes to connect with external platforms, tools, or APIs
         └── __init__.py 
 ```
+
 --->
-
-
