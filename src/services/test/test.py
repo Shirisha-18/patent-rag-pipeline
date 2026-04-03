@@ -2,16 +2,24 @@ import os
 import csv
 import re
 import unicodedata
+from dotenv import load_dotenv
 from datetime import datetime
 from difflib import SequenceMatcher
 from dateparser import parse
 
+# Load .env file
+load_dotenv()
+
 # =================================================
 # CONFIG
 # =================================================
-OCR_ROOT = r"C:\Users\shiri\Dropbox\ocr_patents\ocr_patents\random_sample"
-REFERENCE_CSV = r"C:\Users\shiri\Dropbox\ocr_patents\patents_fyear_iyear.csv"
-OUTPUT_CSV = rf"C:\Users\shiri\Dropbox\ocr_patents\info\patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+OCR_ROOT = os.getenv("OCR_ROOT")
+REFERENCE_CSV = os.getenv("REFERENCE_CSV")
+OUTPUT_CSV = os.path.join(
+    os.getenv("OUTPUT_CSV_DIR"),
+    f"patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+)
+
 
 EARLY_PATENT_NUM = 137279
 FILING_START_DATE = datetime(1873, 4, 1)

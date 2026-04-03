@@ -2,16 +2,24 @@ import os
 import csv
 import re
 import unicodedata
+from dotenv import load_dotenv
 from datetime import datetime
 from difflib import SequenceMatcher
 from dateparser import parse
 
+# Load .env file
+load_dotenv()
+
 # =================================================
 # CONFIG
 # =================================================
-OCR_ROOT = r"C:\Users\shirisha.biyyala\Dropbox\ocr_patents\ocr_patents\random_sample"
-REFERENCE_CSV = r"C:\Users\shirisha.biyyala\Dropbox\ocr_patents\patents_fyear_iyear.csv"
-OUTPUT_CSV = rf"C:\Users\shirisha.biyyala\Dropbox\ocr_patents\info\patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+OCR_ROOT = os.getenv("OCR_ROOT")
+REFERENCE_CSV = os.getenv("REFERENCE_CSV")
+OUTPUT_CSV = os.path.join(
+    os.getenv("OUTPUT_CSV_DIR"),
+    f"patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+)
+
 
 EARLY_PATENT_NUM = 137279
 FILING_START_DATE = datetime(1873, 4, 1)
@@ -616,34 +624,27 @@ def run():
         if previous_issue_date is None:
             if issue_dt:
                 if is_early_patent and issue_dt < EARLIEST_HISTORICAL_DATE:
-                    anomaly_flag = "Error"  # before known historical range
-                elif validation == "Wrong":
-                    anomaly_flag = "Error"  # extracted issue date inconsistent
-                else:
-                    anomaly_flag = "OK"  # first patent passes historical + validation
+                    anomaly_flag = "old patent"
+                # validation == "Wrong" alone is NOT an anomaly — intentionally not flagged
 
         # ===== SUBSEQUENT PATENTS =====
         else:
             if issue_dt:
                 # 1. Monotonicity check: current issue date >= previous patent issue date
                 if issue_dt < previous_issue_date:
-                    anomaly_flag = "Error"
+                    anomaly_flag = "issue < previous issue"
                 # 2. Historical range check for early patents
                 elif is_early_patent and issue_dt < EARLIEST_HISTORICAL_DATE:
-                    anomaly_flag = "Error"
-                # 3 Validation check
-                elif validation == "Wrong":
-                    anomaly_flag = "Error"
-                # 4 Modern patent filing vs issue check
+                    anomaly_flag = "old patent"
+                # 3. Modern patent filing vs issue inconsistency
                 elif (
                     not is_early_patent
                     and filing_dt
                     and filing_dt >= FILING_START_DATE
                     and issue_dt < filing_dt
                 ):
-                    anomaly_flag = "Error"
-                else:
-                    anomaly_flag = "OK"
+                    anomaly_flag = "issue < file"
+                # validation == "Wrong" alone is NOT an anomaly — intentionally not flagged
 
         # Update previous_issue_date for next iteration
         if issue_dt:

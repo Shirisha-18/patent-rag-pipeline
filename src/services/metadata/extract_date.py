@@ -20,6 +20,7 @@ OUTPUT_CSV = os.path.join(
     f"patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
 )
 
+
 EARLY_PATENT_NUM = 137279
 FILING_START_DATE = datetime(1873, 4, 1)
 
@@ -401,21 +402,21 @@ def compare_dates_with_flags(extracted_row, reference_row):
     if not reference_row:
         return "Missing in reference", "Missing in reference", "Missing"
 
-    # Early patents
+    # Early patents — only issue date compared, no filing date in reference
     if patnum_int < EARLY_PATENT_NUM:
         patent_status = (
-            "No"
+            "Yes"  # match
             if (
                 extracted_row["iyear"] == reference_row.get("iyear")
                 and extracted_row["imonth"] == reference_row.get("imonth")
                 and extracted_row["iday"] == reference_row.get("iday")
             )
-            else "Yes"
+            else "No"  # mismatch
         )
         return (
             patent_status,
             "Missing in patent",
-            "Correct" if patent_status == "No" else "Wrong",
+            "Correct" if patent_status == "Yes" else "Wrong",
         )
 
     # Missing reference dates
@@ -430,17 +431,18 @@ def compare_dates_with_flags(extracted_row, reference_row):
         and reference_row.get("fday")
     )
 
+    # Yes = matches, No = mismatch
     issue_status = (
         "Missing in reference"
         if issue_ref_missing
         else (
-            "Yes"
+            "No"  # mismatch
             if (
                 extracted_row["iyear"] != reference_row["iyear"]
                 or extracted_row["imonth"] != reference_row["imonth"]
                 or extracted_row["iday"] != reference_row["iday"]
             )
-            else "No"
+            else "Yes"  # match
         )
     )
 
@@ -448,29 +450,19 @@ def compare_dates_with_flags(extracted_row, reference_row):
         "Missing in reference"
         if filing_ref_missing
         else (
-            "Yes"
+            "No"  # mismatch
             if (
                 extracted_row["fyear"] != reference_row["fyear"]
                 or extracted_row["fmonth"] != reference_row["fmonth"]
                 or extracted_row["fday"] != reference_row["fday"]
             )
-            else "No"
+            else "Yes"  # match
         )
     )
 
-    flag = "Wrong" if "Yes" in (issue_status, filing_status) else "Correct"
+    # "No" now means mismatch
+    flag = "Wrong" if "No" in (issue_status, filing_status) else "Correct"
     return issue_status, filing_status, flag
-
-
-# =================================================
-# SEMANTIC FLIP FOR OUTPUT
-# =================================================
-def flip_semantics(value):
-    if value == "Yes":
-        return "No"
-    if value == "No":
-        return "Yes"
-    return value
 
 
 # =================================================
@@ -532,7 +524,8 @@ def run():
         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
 
         # ===== RESCUE LOGIC =====
-        if issue_comp == "Yes" or filing_comp == "Yes":
+        # "No" = mismatch, so rescue triggers on "No"
+        if issue_comp == "No" or filing_comp == "No":
             folder_path = os.path.join(OCR_ROOT, row["patnum"])
             first_txt = get_first_text_file(folder_path)
             if first_txt:
@@ -556,13 +549,13 @@ def run():
                 candidates = find_alternate_dates(
                     text,
                     exclude_dates=[current_issue]
-                    if issue_comp == "No"
+                    if issue_comp == "Yes"  # issue matches, exclude it
                     else [current_filing],
                 )
                 for dt in candidates:
                     if (
-                        issue_comp == "No"
-                        and filing_comp == "Yes"
+                        issue_comp == "Yes"  # issue ok, filing wrong
+                        and filing_comp == "No"
                         and issue_dt
                         and dt
                         and dt < issue_dt
@@ -573,8 +566,8 @@ def run():
                         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
                         break
                     elif (
-                        issue_comp == "Yes"
-                        and filing_comp == "No"
+                        issue_comp == "No"  # issue wrong, filing ok
+                        and filing_comp == "Yes"
                         and filing_dt
                         and dt
                         and dt > filing_dt
@@ -584,7 +577,7 @@ def run():
                         )
                         issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
                         break
-                    elif issue_comp == "Yes" and filing_comp == "Yes" and dt:
+                    elif issue_comp == "No" and filing_comp == "No" and dt:
                         filing_dt_candidate = dt
                         issue_dt_candidate = None
                         for dt2 in candidates:
@@ -623,61 +616,45 @@ def run():
         if previous_issue_date is None:
             if issue_dt:
                 if is_early_patent and issue_dt < EARLIEST_HISTORICAL_DATE:
-                    anomaly_flag = "Error"  # before known historical range
-                elif validation == "Wrong":
-                    anomaly_flag = "Error"  # extracted issue date inconsistent
-                else:
-                    anomaly_flag = "OK"  # first patent passes historical + validation
+                    anomaly_flag = "old patent"
+                elif not is_early_patent and filing_dt and issue_dt == filing_dt:
+                    anomaly_flag = "issue = file"
+                # validation == "Wrong" alone is NOT an anomaly — intentionally not flagged
 
         # ===== SUBSEQUENT PATENTS =====
         else:
             if issue_dt:
                 # 1. Monotonicity check: current issue date >= previous patent issue date
                 if issue_dt < previous_issue_date:
-                    anomaly_flag = "Error"
+                    anomaly_flag = "issue < previous issue"
                 # 2. Historical range check for early patents
                 elif is_early_patent and issue_dt < EARLIEST_HISTORICAL_DATE:
-                    anomaly_flag = "Error"
-                # 3 Validation check
-                elif validation == "Wrong":
-                    anomaly_flag = "Error"
-                # 4 Modern patent filing vs issue check
+                    anomaly_flag = "old patent"
+                # 3. Issue date equals filing date (non-early patents only)
+                elif not is_early_patent and filing_dt and issue_dt == filing_dt:
+                    anomaly_flag = "issue = file"
+                # 4. Modern patent filing vs issue inconsistency
                 elif (
                     not is_early_patent
                     and filing_dt
                     and filing_dt >= FILING_START_DATE
                     and issue_dt < filing_dt
                 ):
-                    anomaly_flag = "Error"
-                else:
-                    anomaly_flag = "OK"
+                    anomaly_flag = "issue < file"
+                # validation == "Wrong" alone is NOT an anomaly — intentionally not flagged
 
         # Update previous_issue_date for next iteration
         if issue_dt:
             previous_issue_date = issue_dt
 
-        # ===== EARLY PATENT OUTPUT CONTROL =====
-        if is_early_patent:
-            issue_filing_same_date_value = ""
-            issue_greater_than_filing_value = ""
-        else:
-            issue_filing_same_date_value = (
-                "Yes" if issue_dt and filing_dt and issue_dt == filing_dt else "No"
-            )
-            issue_greater_than_filing_value = (
-                "Yes" if issue_dt and filing_dt and issue_dt > filing_dt else "No"
-            )
-
         # ===== FINAL ROW ASSEMBLY =====
         final_rows.append(
             {
                 **row,
-                "issue_date_comparison": flip_semantics(issue_comp),
-                "filing_date_comparison": flip_semantics(filing_comp),
+                "issue_date_comparison": issue_comp,
+                "filing_date_comparison": filing_comp,
                 "validation_result": validation,
                 "anomaly_flag": anomaly_flag,
-                "issue_filing_same_date": issue_filing_same_date_value,
-                "issue_greater_than_filing": issue_greater_than_filing_value,
             }
         )
 
@@ -697,8 +674,6 @@ def run():
                     "filing_date_comparison",
                     "validation_result",
                     "anomaly_flag",
-                    "issue_filing_same_date",
-                    "issue_greater_than_filing",
                 ],
             )
             writer.writeheader()

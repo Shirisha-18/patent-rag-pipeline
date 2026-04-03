@@ -1,19 +1,18 @@
-# OCR-AI-Engine
+# Patent Intelligence Pipeline for OCR-to-RAG Systems
 
  <!--- ![Python](https://img.shields.io/badge/python-3.12-blue) 
  ![Google Cloud](https://img.shields.io/badge/GCP-Vision_API-orange) 
  ![License](https://img.shields.io/badge/license-MIT-green) --->
 
-> Extract text from images and scanned documents using **Google Cloud Vision API**.  
-> Designed as a foundation for OCR pipelines and future RAG / LLM systems.
+> End-to-end pipeline that converts scanned patent TIFF images into structured, validated metadata and retrieval-ready knowledge for RAG and LLM applications.
 
 ## Overview
 
-This project processes scanned patent documents (TIFF format) from USPTO and Google Patents datasets using OCR-based extraction.
+This project builds an end-to-end patent intelligence pipeline that converts raw scanned patent documents (TIFF/images) into structured, validated, and retrieval-ready data. It is designed as a foundational layer for Retrieval-Augmented Generation (RAG) and LLM-based applications.
 
-The system converts unstructured image-based patent documents into structured, machine-readable representations suitable for downstream information retrieval and language model applications.
+The system goes beyond basic OCR by incorporating context-aware parsing, metadata extraction, and anomaly detection, enabling reliable downstream use in search, analytics, and AI systems.
 
-## Patent Domain Context (USPTO Metadata)
+## Background (USPTO Metadata)
 
 USPTO patent documents contain structured bibliographic and legal metadata describing patent applications and grants. This includes identifiers, classification codes, filing information, and prosecution history.
 
@@ -113,54 +112,3 @@ python src/google_cloud_vision.py
 2. Integration with **LangChain / RAG** for text analysis
 3. Store OCR results in database / JSON
 4. Large-scale batch processing with **Google Cloud Storage**
-
-
-<!--- 
-## 📁 Project Structure
-
-```
-├── LICENSE            <- MIT License
-├── README.md          <- The top-level README for developers using this project
-├── data
-│   ├── external       <- Data from third party sources
-│   ├── interim        <- Intermediate data that has been transformed
-│   ├── processed      <- The final, canonical data sets for modeling
-│   └── raw            <- The original, immutable data dump
-│
-├── models             <- Trained and serialized models, model predictions, or model summaries
-│
-├── notebooks          <- Jupyter notebooks. Naming convention is a number (for ordering),
-│                         the creator's initials, and a short `-` delimited description, e.g.
-│                         `1.0-jqp-initial-data-exploration`
-│
-├── references         <- Data dictionaries, manuals, and all other explanatory materials
-│
-├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
-│   └── figures        <- Generated graphics and figures to be used in reporting
-│
-├── requirements.txt   <- The requirements file for reproducing the analysis environment, e.g.
-│                         generated with `pip freeze > requirements.txt`
-│
-└── src                         <- Source code for this project
-    │
-    ├── __init__.py             <- Makes src a Python module
-    │
-    ├── config.py               <- Store useful variables and configuration
-    │
-    ├── dataset.py              <- Scripts to download or generate data
-    │
-    ├── features.py             <- Code to create features for modeling
-    │
-    │    
-    ├── modeling                
-    │   ├── __init__.py 
-    │   ├── predict.py          <- Code to run model inference with trained models          
-    │   └── train.py            <- Code to train models
-    │
-    ├── plots.py                <- Code to create visualizations 
-    │
-    └── services                <- Service classes to connect with external platforms, tools, or APIs
-        └── __init__.py 
-```
-
---->
