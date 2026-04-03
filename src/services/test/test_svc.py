@@ -621,6 +621,7 @@ def run():
                     anomaly_flag = "Error"  # extracted issue date inconsistent
                 else:
                     anomaly_flag = "OK"  # first patent passes historical + validation
+
         # ===== SUBSEQUENT PATENTS =====
         else:
             if issue_dt:

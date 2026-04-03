@@ -2,22 +2,25 @@ import os
 import time
 import csv
 from datetime import datetime
+from dotenv import load_dotenv
 from google.cloud import vision
 import xml.etree.ElementTree as ET
 from tqdm import tqdm
 from contextlib import redirect_stderr
 from io import StringIO
 
+# Load .env file
+load_dotenv()
+
 # ==================================================
 # PATH & ENVIRONMENT CONFIGURATION
 # ==================================================
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "src/vision_key.json"
 
-SOURCE_ROOT = r"C:\Users\shiri\Dropbox\ocr_patents\patent_images_sample\random_sample"
-OUTPUT_ROOT = r"C:\Users\shiri\Dropbox\ocr_patents\ocr_patents\random_sample"
-LOG_DIR = r"C:\Users\shiri\Dropbox\ocr_patents\info"
+SOURCE_ROOT = os.getenv("SOURCE_ROOT")
+OUTPUT_ROOT = os.getenv("OUTPUT_ROOT")
+LOG_DIR = os.getenv("LOG_DIR")
 
 os.makedirs(LOG_DIR, exist_ok=True)
 

@@ -51,7 +51,7 @@ These fields typically exist in structured XML formats in USPTO bulk datasets; h
 ### 4. Output Representation
 - Structured JSON-like patent representation generated from OCR output
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 ├── LICENSE              <- MIT License for open-source usage
