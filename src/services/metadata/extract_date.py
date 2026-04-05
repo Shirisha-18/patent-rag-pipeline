@@ -20,7 +20,6 @@ OUTPUT_CSV = os.path.join(
     f"patent_dates_comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
 )
 
-
 EARLY_PATENT_NUM = 137279
 FILING_START_DATE = datetime(1873, 4, 1)
 
@@ -83,37 +82,51 @@ def safe_date(year, month, day):
 
 
 # =================================================
-# NEW FILTER HELPERS (SAFE ADDITIONS)
+# FILTER HELPERS
 # =================================================
 def is_likely_citation(line):
+    """
+    Returns True if line looks like a citation to another patent.
+
+    KEY FIX: "Letters Patent No." is the patent's own header line —
+    never a citation, even though it contains "Patent No.".
+    All 1800s patents use this exact phrase in their header.
+    """
     l = line.lower()
+    if "letters patent no" in l:
+        return False
     return (
         "prior patent" in l
         or "patent no" in l
         or "u.s. patent" in l
-        or re.search(r"\bno\.\s*\d{3,}", l)
+        or bool(re.search(r"\bno\.\s*\d{3,}", l))
     )
 
 
 def is_noise_line(line):
     l = line.lower()
     return (
-        "renewed" in l
-        or "reissue" in l
-        or "division" in l
-        or "divided" in l
-        or "continuation" in l
-        or "foreign" in l
+        "reissue" in l or "renewed" in l
+        # NOTE: "division"/"continuation"/"foreign" removed here —
+        # they are handled more precisely by is_priority_line and
+        # invalid_filing_words. Keeping them here was too aggressive
+        # and blocked valid lines like filing lines that mention serial numbers.
     )
 
 
 def is_true_filing_line(line):
     l = line.lower()
 
-    # Strong signals
+    # Strong positive signals
     if "application filed" in l:
         return True
     if "[22]" in line or "(22)" in line:
+        return True
+    # FIX Case 6: "Filed Jan. 10, 1967, Ser. No." — standalone Filed + serial
+    if re.search(r"\bfiled\b.{0,40}ser\.?\s*no", l):
+        return True
+    # FIX Case 4: "This application <date>" is the correct filing for divided apps
+    if re.search(r"\bthis application\b", l):
         return True
 
     # Reject misleading contexts
@@ -137,53 +150,133 @@ def is_reference_section(line):
     return "references cited" in l or "u.s. patents" in l or "foreign patents" in l
 
 
+def is_priority_line(line):
+    """
+    Detects lines belonging to foreign/related application priority blocks.
+    Dates on these lines must NOT be used as filing or issue dates.
+    """
+    l = line.lower()
+    return (
+        "[30]" in line
+        or "[32]" in line
+        or "[62]" in line
+        or "[63]" in line
+        or "(30)" in line
+        or "(32)" in line
+        or "(62)" in line
+        or "(63)" in line
+        or "foreign application priority" in l
+        or "foreign priority data" in l
+        or "priority data" in l
+        or "related u.s. application" in l
+        or "continuation-in-part of" in l
+        or "continuation of ser" in l
+        or "division of ser" in l
+        or "claims priority" in l
+        # FIX Case 4: "Original application" lines contain dates that must be ignored
+        or re.search(r"\boriginal application\b", l) is not None
+    )
+
+
+def is_original_application_line(line):
+    """
+    Specifically detects divided/continuation original application lines.
+    These contain dates that should NOT be used as the filing date.
+    The correct filing date for divided apps is on the 'This application' line.
+    """
+    l = line.lower()
+    return bool(
+        re.search(r"\boriginal application\b", l)
+        or re.search(r"\bdivided\b.*\bser\.?\s*no\b", l)
+        or (re.search(r"\bnow patent\b", l) and re.search(r"\bdated\b", l))
+    )
+
+
 # =================================================
 # PRIORITY DATE HANDLER
 # =================================================
 def resolve_priority_dates(text):
+    """
+    For patents with foreign/related priority blocks:
+    - Anchors to [22]/[45] INID codes explicitly
+    - Handles date on same line OR next line(s) (up to 3 lines below)
+    - Ignores all dates in [30]/[32]/[62]/[63] priority blocks
+    - Chronology sanity: filing must be before issue
 
+    Returns (patent_date, filing_date) or (None, None) if not applicable.
+    """
     priority_markers = [
         "[32]",
         "[30]",
+        "[62]",
+        "[63]",
         "foreign application priority",
         "foreign application priority data",
         "foreign priority data",
         "priority data",
+        "related u.s. application data",
+        "related u.s. application",
     ]
 
     lower_text = text.lower()
-
-    # If no priority block exists, skip
     if not any(marker in lower_text for marker in priority_markers):
         return None, None
 
     flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
-
-    dates = []
-
-    # Only scan header area to avoid citation dates
     header_lines = text.splitlines()[:120]
-    header_text = "\n".join(header_lines)
 
-    for m in re.finditer(flexible_date, header_text, re.I):
-        dt = parse(m.group(1))
-        if dt:
-            dates.append(dt)
+    patent_date = None
+    filing_date = None
 
-    dates = sorted(set(dates))
+    def find_date_on_or_after(lines, start_idx):
+        """
+        Look for a date on lines[start_idx] first,
+        then scan up to 3 following lines if not found on the same line.
+        Stops early if it crosses into a priority block line.
+        """
+        for offset in range(4):
+            idx = start_idx + offset
+            if idx >= len(lines):
+                break
+            if is_priority_line(lines[idx]) and offset > 0:
+                break
+            m = re.search(flexible_date, lines[idx], re.I)
+            if m:
+                dt = parse(m.group(1))
+                if dt:
+                    return dt
+        return None
 
-    # Need at least 3 dates
-    if len(dates) < 3:
-        return None, None
+    for i, line in enumerate(header_lines):
+        stripped = line.strip()
 
-    filing_dt = min(dates)
-    patent_dt = max(dates)
+        if is_priority_line(stripped):
+            continue
 
-    return (patent_dt.strftime("%m/%d/%Y"), filing_dt.strftime("%m/%d/%Y"))
+        # Anchor [45] → issue date
+        if not patent_date and ("[45]" in stripped or "(45)" in stripped):
+            dt = find_date_on_or_after(header_lines, i)
+            if dt:
+                patent_date = dt.strftime("%m/%d/%Y")
+
+        # Anchor [22] → filing date
+        if not filing_date and ("[22]" in stripped or "(22)" in stripped):
+            dt = find_date_on_or_after(header_lines, i)
+            if dt:
+                filing_date = dt.strftime("%m/%d/%Y")
+
+    if patent_date and filing_date:
+        p = parse(patent_date)
+        f = parse(filing_date)
+        if f and p and f > p:
+            return None, None
+        return patent_date, filing_date
+
+    return None, None
 
 
 # =================================================
-# DATE EXTRACTION (High recall + multi-line, ignoring Renewed)
+# DATE EXTRACTION
 # =================================================
 def extract_patent_dates(text):
     text = normalize_text(text)
@@ -208,6 +301,8 @@ def extract_patent_dates(text):
         "substitute",
         "corrected",
         "amended",
+        # FIX Case 4: original application dates must not become filing date
+        "original application",
     ]
 
     for i in range(len(lines)):
@@ -227,25 +322,44 @@ def extract_patent_dates(text):
     flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
 
     patent_patterns = [
+        # 1800s formats — must be first, most specific
+        # Covers both:
+        #   "Letters Patent No. 434,583, dated August 19, 1890."
+        #   "SPECIFICATION forming part of Letters Patent No. X, dated <date>"
+        rf"[Ll]etters\s+[Pp]atent\s+[Nn]o\.?\s*[\d,]+,?\s*dated\s+{flexible_date}",
+        # Modern INID anchors
+        rf"\(45\).*?{flexible_date}",
+        rf"\[45\].*?{flexible_date}",
+        # "Patented <date>" — used in early 1900s and mid-century patents
+        rf"[Pp]atented\s+{flexible_date}",
+        # Generic fallbacks
         rf"patent\w*\s+{flexible_date}",
         rf"patent\w*.*?{flexible_date}",
         rf"letters patent.*?dated\s+{flexible_date}",
         rf"dated\s+{flexible_date}",
-        rf"\(45\).*?{flexible_date}",
-        rf"\[45\].*?{flexible_date}",
     ]
 
     filed_patterns = [
-        rf"application.*?file\w*\s+{flexible_date}",
-        rf"file\w*\s+{flexible_date}",
+        # Most explicit first: "Application filed <date>"  (1800s–early 1900s)
+        rf"[Aa]pplication\s+filed\s+{flexible_date}",
+        # FIX Case 4: "This application <date>, Ser. No." — divided/continuation correct filing
+        rf"[Tt]his\s+application\s+{flexible_date}",
+        # Modern INID anchors
         rf"\(22\).*?{flexible_date}",
         rf"\[22\].*?{flexible_date}",
+        # FIX Case 6: "Filed <date>, Ser. No." — standalone Filed with serial
+        rf"[Ff]iled\s+{flexible_date}",
+        # Generic fallbacks
+        rf"application.*?file\w*\s+{flexible_date}",
+        rf"file\w*\s+{flexible_date}",
         rf"application\s+{flexible_date}",
     ]
 
     # ================= PRIMARY EXTRACTION =================
     for line in combined_lines:
-        lower_line = line.lower()
+        # Skip priority/related/original-application lines — dates here are not issue/filing
+        if is_priority_line(line):
+            continue
 
         if is_noise_line(line):
             continue
@@ -277,6 +391,9 @@ def extract_patent_dates(text):
     # ================= FUZZY RESCUE =================
     if not patent_date or not filed_date:
         for line in combined_lines:
+            if is_priority_line(line):
+                continue
+
             m = re.search(flexible_date, line, re.I)
             if not m:
                 continue
@@ -302,14 +419,21 @@ def extract_patent_dates(text):
                     filed_date = formatted
                     continue
 
+            # FIX Case 3: guard "issued" in fuzzy rescue — only use it if NOT a citation line
+            # "patented" is safe; "issued" is risky because citations say "issued to X on <date>"
             if (
                 not patent_date
                 and not is_likely_citation(line)
                 and (
                     fuzzy_contains(lower_line, "patented")
-                    or fuzzy_contains(lower_line, "issued")
                     or "[45]" in line
                     or "(45)" in line
+                    # "issued" only allowed if no person/assignee name context nearby
+                    or (
+                        fuzzy_contains(lower_line, "issued")
+                        and not re.search(r"issued to\b", lower_line)
+                        and not re.search(r"issued [A-Z][a-z]", line)
+                    )
                 )
             ):
                 if "renewed" not in lower_line:
@@ -317,10 +441,15 @@ def extract_patent_dates(text):
                     continue
 
     # ================= SECOND PASS (FIXED POSITION) =================
+    # Handles patents where "Patented <date>" only appears deep in the document body
+    # e.g. 1910s–1960s era patents like 1,294,122 / 3,445,944 / 3,052,062
     if not patent_date:
         for i, line in enumerate(lines):
             if i < 80:
                 continue
+            if is_priority_line(line):
+                continue
+            # FIX Case 3: use "patented" only, not "issued" — too risky in body text
             if "patented" in line.lower():
                 m = re.search(flexible_date, line, re.I)
                 if m:
@@ -346,6 +475,8 @@ def extract_patent_dates(text):
             "December",
         ]
         for i, line in enumerate(lines):
+            if is_priority_line(line):
+                continue
             for month in months:
                 if month in line:
                     day, year = None, None
@@ -398,20 +529,18 @@ def load_csv_dict(path):
 def compare_dates_with_flags(extracted_row, reference_row):
     patnum_int = int(normalize_patnum(extracted_row["patnum"]))
 
-    # Patent missing in reference
     if not reference_row:
         return "Missing in reference", "Missing in reference", "Missing"
 
-    # Early patents — only issue date compared, no filing date in reference
     if patnum_int < EARLY_PATENT_NUM:
         patent_status = (
-            "Yes"  # match
+            "Yes"
             if (
                 extracted_row["iyear"] == reference_row.get("iyear")
                 and extracted_row["imonth"] == reference_row.get("imonth")
                 and extracted_row["iday"] == reference_row.get("iday")
             )
-            else "No"  # mismatch
+            else "No"
         )
         return (
             patent_status,
@@ -419,7 +548,6 @@ def compare_dates_with_flags(extracted_row, reference_row):
             "Correct" if patent_status == "Yes" else "Wrong",
         )
 
-    # Missing reference dates
     issue_ref_missing = not (
         reference_row.get("iyear")
         and reference_row.get("imonth")
@@ -431,18 +559,17 @@ def compare_dates_with_flags(extracted_row, reference_row):
         and reference_row.get("fday")
     )
 
-    # Yes = matches, No = mismatch
     issue_status = (
         "Missing in reference"
         if issue_ref_missing
         else (
-            "No"  # mismatch
+            "No"
             if (
                 extracted_row["iyear"] != reference_row["iyear"]
                 or extracted_row["imonth"] != reference_row["imonth"]
                 or extracted_row["iday"] != reference_row["iday"]
             )
-            else "Yes"  # match
+            else "Yes"
         )
     )
 
@@ -450,19 +577,55 @@ def compare_dates_with_flags(extracted_row, reference_row):
         "Missing in reference"
         if filing_ref_missing
         else (
-            "No"  # mismatch
+            "No"
             if (
                 extracted_row["fyear"] != reference_row["fyear"]
                 or extracted_row["fmonth"] != reference_row["fmonth"]
                 or extracted_row["fday"] != reference_row["fday"]
             )
-            else "Yes"  # match
+            else "Yes"
         )
     )
 
-    # "No" now means mismatch
     flag = "Wrong" if "No" in (issue_status, filing_status) else "Correct"
     return issue_status, filing_status, flag
+
+
+# =================================================
+# MONOTONICITY RESCUE
+# =================================================
+def rescue_monotonicity(text, previous_issue_date, current_issue_dt):
+    """
+    When issue < previous issue, scan the document for another date that:
+      - Is >= previous_issue_date  (respects monotonicity)
+      - Is > current extracted filing date (valid issue > filing ordering)
+      - Is not on a priority/citation/noise line
+
+    Returns a new issue date string (MM/DD/YYYY) or None if not found.
+
+    """
+    flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
+    lines = text.splitlines()
+    candidates = []
+
+    for line in lines:
+        if is_priority_line(line):
+            continue
+        if is_likely_citation(line):
+            continue
+        if is_reference_section(line):
+            break
+        for m in re.finditer(flexible_date, line, re.I):
+            dt = parse(m.group(1))
+            if dt and dt >= previous_issue_date and dt != current_issue_dt:
+                candidates.append(dt)
+
+    if candidates:
+        # Prefer the smallest valid date (earliest that still satisfies monotonicity)
+        best = min(candidates)
+        return best.strftime("%m/%d/%Y")
+
+    return None
 
 
 # =================================================
@@ -470,6 +633,8 @@ def compare_dates_with_flags(extracted_row, reference_row):
 # =================================================
 def run():
     extracted_rows = []
+    # Cache text per patent for rescue re-use
+    text_cache = {}
 
     for folder in sorted(os.listdir(OCR_ROOT)):
         folder_path = os.path.join(OCR_ROOT, folder)
@@ -485,7 +650,8 @@ def run():
         ) as f:
             text = f.read()
 
-        # ---- PRIORITY DATE FIX ----
+        text_cache[folder] = text
+
         priority_patent, priority_filing = resolve_priority_dates(text)
 
         if priority_patent and priority_filing:
@@ -493,6 +659,7 @@ def run():
             filed_date = priority_filing
         else:
             patent_date, filed_date = extract_patent_dates(text)
+
         pyear, pmonth, pday = split_date(patent_date)
         fyear, fmonth, fday = split_date(filed_date)
 
@@ -523,93 +690,77 @@ def run():
         issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
 
-        # ===== RESCUE LOGIC =====
-        # "No" = mismatch, so rescue triggers on "No"
+        # ===== RESCUE LOGIC (reference mismatch) =====
         if issue_comp == "No" or filing_comp == "No":
-            folder_path = os.path.join(OCR_ROOT, row["patnum"])
-            first_txt = get_first_text_file(folder_path)
-            if first_txt:
-                with open(
-                    os.path.join(folder_path, first_txt),
-                    "r",
-                    encoding="utf-8",
-                    errors="ignore",
-                ) as f:
-                    text = f.read()
-                current_issue = (
-                    f"{row['imonth']}/{row['iday']}/{row['iyear']}"
-                    if row["iyear"]
-                    else ""
-                )
-                current_filing = (
-                    f"{row['fmonth']}/{row['fday']}/{row['fyear']}"
-                    if row["fyear"]
-                    else ""
-                )
-                candidates = find_alternate_dates(
-                    text,
-                    exclude_dates=[current_issue]
-                    if issue_comp == "Yes"  # issue matches, exclude it
-                    else [current_filing],
-                )
-                for dt in candidates:
-                    if (
-                        issue_comp == "Yes"  # issue ok, filing wrong
-                        and filing_comp == "No"
-                        and issue_dt
-                        and dt
-                        and dt < issue_dt
-                    ):
+            text = text_cache.get(row["patnum"], "")
+            current_issue = (
+                f"{row['imonth']}/{row['iday']}/{row['iyear']}" if row["iyear"] else ""
+            )
+            current_filing = (
+                f"{row['fmonth']}/{row['fday']}/{row['fyear']}" if row["fyear"] else ""
+            )
+            candidates = find_alternate_dates(
+                text,
+                exclude_dates=[current_issue]
+                if issue_comp == "Yes"
+                else [current_filing],
+            )
+            for dt in candidates:
+                if (
+                    issue_comp == "Yes"
+                    and filing_comp == "No"
+                    and issue_dt
+                    and dt
+                    and dt < issue_dt
+                ):
+                    row["fyear"], row["fmonth"], row["fday"] = split_date(
+                        dt.strftime("%m/%d/%Y")
+                    )
+                    filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
+                    break
+                elif (
+                    issue_comp == "No"
+                    and filing_comp == "Yes"
+                    and filing_dt
+                    and dt
+                    and dt > filing_dt
+                ):
+                    row["iyear"], row["imonth"], row["iday"] = split_date(
+                        dt.strftime("%m/%d/%Y")
+                    )
+                    issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
+                    break
+                elif issue_comp == "No" and filing_comp == "No" and dt:
+                    filing_dt_candidate = dt
+                    issue_dt_candidate = None
+                    for dt2 in candidates:
+                        if dt2 and dt2 > filing_dt_candidate:
+                            issue_dt_candidate = dt2
+                            break
+                    if filing_dt_candidate and issue_dt_candidate:
                         row["fyear"], row["fmonth"], row["fday"] = split_date(
-                            dt.strftime("%m/%d/%Y")
+                            filing_dt_candidate.strftime("%m/%d/%Y")
+                        )
+                        row["iyear"], row["imonth"], row["iday"] = split_date(
+                            issue_dt_candidate.strftime("%m/%d/%Y")
                         )
                         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
-                        break
-                    elif (
-                        issue_comp == "No"  # issue wrong, filing ok
-                        and filing_comp == "Yes"
-                        and filing_dt
-                        and dt
-                        and dt > filing_dt
-                    ):
-                        row["iyear"], row["imonth"], row["iday"] = split_date(
-                            dt.strftime("%m/%d/%Y")
-                        )
                         issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
                         break
-                    elif issue_comp == "No" and filing_comp == "No" and dt:
-                        filing_dt_candidate = dt
-                        issue_dt_candidate = None
-                        for dt2 in candidates:
-                            if dt2 and dt2 > filing_dt_candidate:
-                                issue_dt_candidate = dt2
-                                break
-                        if filing_dt_candidate and issue_dt_candidate:
-                            row["fyear"], row["fmonth"], row["fday"] = split_date(
-                                filing_dt_candidate.strftime("%m/%d/%Y")
-                            )
-                            row["iyear"], row["imonth"], row["iday"] = split_date(
-                                issue_dt_candidate.strftime("%m/%d/%Y")
-                            )
-                            filing_dt = safe_date(
-                                row["fyear"], row["fmonth"], row["fday"]
-                            )
-                            issue_dt = safe_date(
-                                row["iyear"], row["imonth"], row["iday"]
-                            )
-                            break
 
-        # Recompute safe dates
+        # Recompute safe dates after rescue
         issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
 
         patnum_int = int(normalize_patnum(row["patnum"]))
         is_early_patent = patnum_int < EARLY_PATENT_NUM
 
+        # FIX Case 8: filing_comp == "Missing in patent" means filing date is
+        # structurally absent (early patents predate filing records) — not an anomaly
+        filing_structurally_absent = filing_comp == "Missing in patent"
+
         # ===== ANOMALY LOGIC =====
         anomaly_flag = "OK"
-
-        # Historical start date for early patents
         EARLIEST_HISTORICAL_DATE = datetime(1843, 7, 26)
 
         # ===== FIRST PATENT =====
@@ -617,33 +768,75 @@ def run():
             if issue_dt:
                 if is_early_patent and issue_dt < EARLIEST_HISTORICAL_DATE:
                     anomaly_flag = "old patent"
-                elif not is_early_patent and filing_dt and issue_dt == filing_dt:
+                elif (
+                    not is_early_patent
+                    and not filing_structurally_absent
+                    and filing_dt
+                    and issue_dt == filing_dt
+                ):
                     anomaly_flag = "issue = file"
-                # validation == "Wrong" alone is NOT an anomaly — intentionally not flagged
 
         # ===== SUBSEQUENT PATENTS =====
         else:
             if issue_dt:
-                # 1. Monotonicity check: current issue date >= previous patent issue date
-                if issue_dt < previous_issue_date:
-                    anomaly_flag = "issue < previous issue"
-                # 2. Historical range check for early patents
+                # 1. issue = file — explicit, checked first (Case 1 priority fix)
+                if (
+                    not is_early_patent
+                    and not filing_structurally_absent
+                    and filing_dt
+                    and issue_dt == filing_dt
+                ):
+                    anomaly_flag = "issue = file"
+
+                # 2. Monotonicity: issue dates must be non-decreasing
+                elif issue_dt < previous_issue_date:
+                    # FIX Case 7: attempt rescue before accepting the flag —
+                    # scan current document for a date >= previous_issue_date
+                    text = text_cache.get(row["patnum"], "")
+                    rescued = rescue_monotonicity(text, previous_issue_date, issue_dt)
+                    if rescued:
+                        row["iyear"], row["imonth"], row["iday"] = split_date(rescued)
+                        issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
+                        # Re-check issue = file after rescue
+                        if (
+                            not is_early_patent
+                            and not filing_structurally_absent
+                            and filing_dt
+                            and issue_dt == filing_dt
+                        ):
+                            anomaly_flag = "issue = file"
+                        # Re-check issue < file after rescue
+                        elif (
+                            not is_early_patent
+                            and not filing_structurally_absent
+                            and filing_dt
+                            and filing_dt >= FILING_START_DATE
+                            and issue_dt
+                            and issue_dt < filing_dt
+                        ):
+                            anomaly_flag = "issue < file"
+                        else:
+                            anomaly_flag = "OK"
+                    else:
+                        anomaly_flag = "issue < previous issue"
+
+                # 3. Historical floor for early patents
                 elif is_early_patent and issue_dt < EARLIEST_HISTORICAL_DATE:
                     anomaly_flag = "old patent"
-                # 3. Issue date equals filing date (non-early patents only)
-                elif not is_early_patent and filing_dt and issue_dt == filing_dt:
-                    anomaly_flag = "issue = file"
-                # 4. Modern patent filing vs issue inconsistency
+
+                # 4. Modern patent: issue before filing
                 elif (
                     not is_early_patent
+                    and not filing_structurally_absent
                     and filing_dt
                     and filing_dt >= FILING_START_DATE
                     and issue_dt < filing_dt
                 ):
                     anomaly_flag = "issue < file"
-                # validation == "Wrong" alone is NOT an anomaly — intentionally not flagged
 
-        # Update previous_issue_date for next iteration
+                # validation == "Wrong" alone is NOT an anomaly
+
+        # Update tracker for next patent's monotonicity check
         if issue_dt:
             previous_issue_date = issue_dt
 

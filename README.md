@@ -58,12 +58,6 @@ These fields typically exist in structured XML formats in USPTO bulk datasets; h
 ├── requirements.txt     <- Python dependencies for the OCR pipeline
 ├── .gitignore           <- Files and folders excluded from version control
 
-├── data/
-│   ├── raw/             <- Input TIFF patent images (USPTO / Google Patents)
-│   ├── processed/       <- OCR outputs and extracted structured data
-│   ├── external/        <- (Optional) external reference datasets if used
-│   ├── interim/         <- Intermediate OCR outputs before final processing
-
 ├── src/
 │   └── services/
 │       ├── ocr/         <- Google Cloud Vision OCR extraction scripts
