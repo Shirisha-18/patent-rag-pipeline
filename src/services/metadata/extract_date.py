@@ -47,7 +47,11 @@ def split_date(date_str):
         return "", "", ""
     try:
         dt = datetime.strptime(date_str, "%m/%d/%Y")
-        return str(dt.year), str(dt.month), str(dt.day)
+        return (
+            str(dt.year),
+            str(dt.month),
+            str(dt.day),
+        )
     except:
         return "", "", ""
 
@@ -61,14 +65,25 @@ def fuzzy_contains(line, target, threshold=0.72):
 
 
 def find_alternate_dates(text, exclude_dates=[]):
-    """Find all dates in text except those in exclude_dates"""
+    """Find all valid dates excluding citations, priority, and noise"""
     flexible_date = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
+
     exclude_dts = [parse(d) for d in exclude_dates if d]
     candidates = []
-    for m in re.finditer(flexible_date, text, re.I):
-        dt = parse(m.group(1))
-        if dt and dt not in exclude_dts:
-            candidates.append(dt)
+
+    for line in text.splitlines():
+        if is_priority_line(line):
+            continue
+        if is_likely_citation(line):
+            continue
+        if is_reference_section(line):
+            break
+
+        for m in re.finditer(flexible_date, line, re.I):
+            dt = parse(m.group(1))
+            if dt and dt not in exclude_dts:
+                candidates.append(dt)
+
     return sorted(set(candidates))
 
 
@@ -530,65 +545,69 @@ def compare_dates_with_flags(extracted_row, reference_row):
     patnum_int = int(normalize_patnum(extracted_row["patnum"]))
 
     if not reference_row:
-        return "Missing in reference", "Missing in reference", "Missing"
+        return "Missing in reference", "Missing in reference", "Wrong"
 
+    # ================= BUILD EXTRACTED DATES =================
+    extracted_issue = (
+        extracted_row["iyear"],
+        extracted_row["imonth"],
+        extracted_row["iday"],
+    )
+
+    extracted_filing = (
+        extracted_row["fyear"],
+        extracted_row["fmonth"],
+        extracted_row["fday"],
+    )
+
+    # ================= BUILD REFERENCE =================
+    ref_issue = (
+        reference_row.get("iyear"),
+        reference_row.get("imonth"),
+        reference_row.get("iday"),
+    )
+
+    ref_filing = (
+        reference_row.get("fyear"),
+        reference_row.get("fmonth"),
+        reference_row.get("fday"),
+    )
+
+    def is_valid(date_tuple):
+        return all(date_tuple)
+
+    # ================= EARLY PATENTS =================
     if patnum_int < EARLY_PATENT_NUM:
-        patent_status = (
-            "Yes"
-            if (
-                extracted_row["iyear"] == reference_row.get("iyear")
-                and extracted_row["imonth"] == reference_row.get("imonth")
-                and extracted_row["iday"] == reference_row.get("iday")
-            )
-            else "No"
-        )
+        issue_status = "Yes" if extracted_issue == ref_issue else "No"
         return (
-            patent_status,
+            issue_status,
             "Missing in patent",
-            "Correct" if patent_status == "Yes" else "Wrong",
+            ("Correct" if issue_status == "Yes" else "Wrong"),
         )
 
-    issue_ref_missing = not (
-        reference_row.get("iyear")
-        and reference_row.get("imonth")
-        and reference_row.get("iday")
-    )
-    filing_ref_missing = not (
-        reference_row.get("fyear")
-        and reference_row.get("fmonth")
-        and reference_row.get("fday")
-    )
+    # ================= ISSUE =================
+    if not is_valid(ref_issue):
+        issue_status = "Missing in reference"
+    elif extracted_issue == ref_issue:
+        issue_status = "Yes"
+    else:
+        issue_status = "No"
 
-    issue_status = (
-        "Missing in reference"
-        if issue_ref_missing
-        else (
-            "No"
-            if (
-                extracted_row["iyear"] != reference_row["iyear"]
-                or extracted_row["imonth"] != reference_row["imonth"]
-                or extracted_row["iday"] != reference_row["iday"]
-            )
-            else "Yes"
-        )
-    )
+    # ================= FILING =================
+    if not is_valid(ref_filing):
+        filing_status = "Missing in reference"
+    elif extracted_filing == ref_filing:
+        filing_status = "Yes"
+    else:
+        filing_status = "No"
 
-    filing_status = (
-        "Missing in reference"
-        if filing_ref_missing
-        else (
-            "No"
-            if (
-                extracted_row["fyear"] != reference_row["fyear"]
-                or extracted_row["fmonth"] != reference_row["fmonth"]
-                or extracted_row["fday"] != reference_row["fday"]
-            )
-            else "Yes"
-        )
-    )
+    # ================= FINAL VALIDATION =================
+    if issue_status == "Yes" and filing_status in ["Yes", "Missing in reference"]:
+        validation = "Correct"
+    else:
+        validation = "Wrong"
 
-    flag = "Wrong" if "No" in (issue_status, filing_status) else "Correct"
-    return issue_status, filing_status, flag
+    return issue_status, filing_status, validation
 
 
 # =================================================
@@ -690,64 +709,6 @@ def run():
         issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
 
-        # ===== RESCUE LOGIC (reference mismatch) =====
-        if issue_comp == "No" or filing_comp == "No":
-            text = text_cache.get(row["patnum"], "")
-            current_issue = (
-                f"{row['imonth']}/{row['iday']}/{row['iyear']}" if row["iyear"] else ""
-            )
-            current_filing = (
-                f"{row['fmonth']}/{row['fday']}/{row['fyear']}" if row["fyear"] else ""
-            )
-            candidates = find_alternate_dates(
-                text,
-                exclude_dates=[current_issue]
-                if issue_comp == "Yes"
-                else [current_filing],
-            )
-            for dt in candidates:
-                if (
-                    issue_comp == "Yes"
-                    and filing_comp == "No"
-                    and issue_dt
-                    and dt
-                    and dt < issue_dt
-                ):
-                    row["fyear"], row["fmonth"], row["fday"] = split_date(
-                        dt.strftime("%m/%d/%Y")
-                    )
-                    filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
-                    break
-                elif (
-                    issue_comp == "No"
-                    and filing_comp == "Yes"
-                    and filing_dt
-                    and dt
-                    and dt > filing_dt
-                ):
-                    row["iyear"], row["imonth"], row["iday"] = split_date(
-                        dt.strftime("%m/%d/%Y")
-                    )
-                    issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
-                    break
-                elif issue_comp == "No" and filing_comp == "No" and dt:
-                    filing_dt_candidate = dt
-                    issue_dt_candidate = None
-                    for dt2 in candidates:
-                        if dt2 and dt2 > filing_dt_candidate:
-                            issue_dt_candidate = dt2
-                            break
-                    if filing_dt_candidate and issue_dt_candidate:
-                        row["fyear"], row["fmonth"], row["fday"] = split_date(
-                            filing_dt_candidate.strftime("%m/%d/%Y")
-                        )
-                        row["iyear"], row["imonth"], row["iday"] = split_date(
-                            issue_dt_candidate.strftime("%m/%d/%Y")
-                        )
-                        filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
-                        issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
-                        break
-
         # Recompute safe dates after rescue
         issue_dt = safe_date(row["iyear"], row["imonth"], row["iday"])
         filing_dt = safe_date(row["fyear"], row["fmonth"], row["fday"])
@@ -761,7 +722,7 @@ def run():
 
         # ===== ANOMALY LOGIC =====
         anomaly_flag = "OK"
-        EARLIEST_HISTORICAL_DATE = datetime(1843, 7, 26)
+        EARLIEST_HISTORICAL_DATE = datetime(1836, 7, 13)
 
         # ===== FIRST PATENT =====
         if previous_issue_date is None:
