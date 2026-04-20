@@ -10,8 +10,8 @@ Architecture:
     4. extract_dates()      — public entry point
 
 Era boundaries (patent number → year):
-    A   1       –  137,279   (1836–1872)  "dated" in spec line, no filing date
-    B   137,280 –  589,999   (1873–1897)  "dated" + "Application filed" same line
+    A   1       –  134,503   (1836–1872)  "dated" in spec line, no filing date
+    B   134,504 –  589,999   (1873–1897)  "dated" + "Application filed" same line
     B→C 590,000 –  935,999   (1897–1909)  both "Patented" header + "dated" spec line
     C   936,000 – 1,919,999  (1909–1933)  "Patented" own line + "Application filed"
     D  1,920,000 – 2,924,999 (1933–1960)  "Patented" own line + "Application" no filed
@@ -33,7 +33,7 @@ from dateparser import parse as dateparse
 # CONSTANTS
 # =============================================================================
 
-ERA_A_END = 137_279
+ERA_A_END = 134_503
 ERA_B_END = 589_999
 ERA_BC_END = 935_999
 ERA_C_END = 1_919_999
@@ -376,6 +376,7 @@ def _extract_era_d(all_lines: list) -> ExtractionResult:
     """
     patented_pat = rf"[Pp]atented\s+{FLEXIBLE_DATE}"
     # Primary filing: bare "Application <date>" (no "filed", no "Original")
+    # \b instead of ^ so OCR leading spaces don't block the match
     filing_primary = rf"\bApplication\s+{FLEXIBLE_DATE}"
     # Divided app: "this application <date>"
     filing_divided = rf"\bthis\s+application\s+{FLEXIBLE_DATE}"
@@ -433,12 +434,17 @@ def _extract_era_d(all_lines: list) -> ExtractionResult:
 def _extract_era_e(all_lines: list) -> ExtractionResult:
     """
     Era E (~2,925,000–3,649,999): 1960–1971
-    Filing: 'Filed Month DD, YYYY, Ser. No.' in header (page 1)
-    Issue:  'Patented Month DD, YYYY' appears in body (page 2, ~line 40–100)
-            Use body scan as primary for issue.
+    Filing: 'Filed Month DD, YYYY, Ser. No.' in header (page 1)   [primary]
+            'Application Month DD, YYYY' — Era D style fallback    [transition patents]
+    Issue:  'Patented Month DD, YYYY' appears in body              [primary, start_line=5]
     Divided apps: same 'this application' logic as Era D.
+
+    Note: some patents in this range retain Era D filing format
+    ('Application <date>' with no 'Filed' keyword). The Era D pattern
+    is tried as a MED-confidence fallback if the primary fails.
     """
-    filing_pat = rf"\bFiled\s+{FLEXIBLE_DATE}"
+    filing_pat_e = rf"\bFiled\s+{FLEXIBLE_DATE}"
+    filing_pat_d = rf"\bApplication\s+{FLEXIBLE_DATE}"  # Era D transition fallback
     filing_divided = rf"\bthis\s+application\s+{FLEXIBLE_DATE}"
     original_pat = r"[Oo]riginal\s+application"
 
@@ -448,24 +454,40 @@ def _extract_era_e(all_lines: list) -> ExtractionResult:
     # Filing is in the header — scan first 30 lines
     header = _sliding_joins(all_lines[:30])
     for line in header:
-        if not filing:
-            m = re.search(filing_divided, line, re.I)
-            if m:
-                filing = parse_date(m.group(1))
-                filing_conf = Confidence.HIGH
-                break
+        if filing:
+            break
 
+        # Divided application takes priority over everything
+        m = re.search(filing_divided, line, re.I)
+        if m:
+            filing = parse_date(m.group(1))
+            filing_conf = Confidence.HIGH
+            break
+
+        # Skip original/parent application lines
+        if re.search(original_pat, line, re.I):
+            continue
+
+        # Primary: 'Filed <date>'
+        m = re.search(filing_pat_e, line, re.I)
+        if m:
+            filing = parse_date(m.group(1))
+            filing_conf = Confidence.HIGH
+            break
+
+    # Fallback: Era D style 'Application <date>' for transition patents
+    if not filing:
+        for line in header:
             if re.search(original_pat, line, re.I):
                 continue
-
-            m = re.search(filing_pat, line, re.I)
+            m = re.search(filing_pat_d, line, re.I)
             if m:
                 filing = parse_date(m.group(1))
-                filing_conf = Confidence.HIGH
+                filing_conf = Confidence.MED  # MED — signals Era D pattern used
                 break
 
-    # Issue is in the body — Layer 2 is the PRIMARY scan for this era
-    issue = _body_scan_issue(all_lines, start_line=20)
+    # Issue is in the body — start at line 5 (some patents have it early)
+    issue = _body_scan_issue(all_lines, start_line=5)
     issue_conf = Confidence.MED if issue else Confidence.NONE
 
     return ExtractionResult(
@@ -480,51 +502,86 @@ def _extract_era_e(all_lines: list) -> ExtractionResult:
 def _extract_era_f(all_lines: list) -> ExtractionResult:
     """
     Era F (~3,650,000+): 1971–present
-    Issue:  [45] INID code — date on same line or next line
-    Filing: [22] INID code — date on same line or next line
+    Issue:  [45] INID code
+    Filing: [22] INID code
     All [30]/[32]/[62]/[63] priority lines are completely ignored.
+
+    Two-column OCR problem:
+        Many patents in this era are typeset in two columns. OCR reads
+        left column top-to-bottom then right column top-to-bottom, so:
+
+            [22] Filed          Sept. 23, 1968      ← same line (simple case)
+
+        or:
+            [22] Filed                              ← left col line 3
+            [45] Patented                           ← left col line 4
+            Sept. 23, 1968                          ← right col line 3
+            May 18, 1971                            ← right col line 4
+
+        In the split case, [22] appears on line 3 and its date on line 8+,
+        well beyond the 3-line lookahead of the old strategy.
+
+    Solution — positional pairing:
+        1. Find the line index of [22] and [45] anchors.
+        2. Collect all dates in the header block (first 80 lines),
+           recording each date's line index.
+        3. Pair: first date whose line index > [22] index = filing date.
+                 first date whose line index > [45] index = issue date.
+        This is stable whether columns are split or inline.
     """
     PRIORITY_CODES = {"[30]", "[32]", "[62]", "[63]", "(30)", "(32)", "(62)", "(63)"}
+    HEADER_LINES = 80
 
-    issue = None
-    filing = None
-    issue_conf = Confidence.NONE
-    filing_conf = Confidence.NONE
-
-    def is_priority_line(line):
+    def is_priority_line(line: str) -> bool:
         return any(code in line for code in PRIORITY_CODES)
 
-    def date_on_or_after(idx: int) -> Optional[str]:
-        """Look for a date on line idx, or up to 3 lines after."""
-        for offset in range(4):
-            i = idx + offset
-            if i >= len(all_lines):
-                break
-            if offset > 0 and is_priority_line(all_lines[i]):
-                break
-            d = first_date_in_line(all_lines[i])
-            if d:
-                return d
-        return None
+    header = all_lines[:HEADER_LINES]
 
-    for i, line in enumerate(all_lines[:120]):
+    # --- Step 1: find anchor line indices ---
+    idx_22 = None  # [22] Filing date anchor
+    idx_45 = None  # [45] Issue date anchor
+
+    for i, line in enumerate(header):
         if is_priority_line(line):
             continue
+        if idx_22 is None and ("[22]" in line or "(22)" in line):
+            idx_22 = i
+        if idx_45 is None and ("[45]" in line or "(45)" in line):
+            idx_45 = i
 
-        if not issue and ("[45]" in line or "(45)" in line):
-            d = date_on_or_after(i)
-            if d:
-                issue = d
-                issue_conf = Confidence.HIGH
+    # --- Step 2: collect all dated lines (index, date) ---
+    dated_lines = []
+    for i, line in enumerate(header):
+        if is_priority_line(line):
+            continue
+        d = first_date_in_line(line)
+        if d:
+            dated_lines.append((i, d))
 
-        if not filing and ("[22]" in line or "(22)" in line):
-            d = date_on_or_after(i)
-            if d:
-                filing = d
-                filing_conf = Confidence.HIGH
+    # --- Step 3: pair by position ---
+    def first_date_after(anchor_idx: Optional[int]) -> Optional[str]:
+        if anchor_idx is None:
+            return None
+        for line_idx, date in dated_lines:
+            if line_idx >= anchor_idx:
+                return date
+        return None
 
-        if issue and filing:
-            break
+    filing = first_date_after(idx_22)
+    issue = first_date_after(idx_45)
+
+    # Sanity: issue should be after filing chronologically
+    # If they're swapped (OCR column order reversed), swap them back
+    if issue and filing:
+        from dateparser import parse as dp
+
+        dt_issue = dp(issue)
+        dt_filing = dp(filing)
+        if dt_issue and dt_filing and dt_filing > dt_issue:
+            issue, filing = filing, issue
+
+    issue_conf = Confidence.HIGH if issue else Confidence.NONE
+    filing_conf = Confidence.HIGH if filing else Confidence.NONE
 
     # Layer 2 fallback for issue only
     if not issue:
