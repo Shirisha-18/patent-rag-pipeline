@@ -1,274 +1,759 @@
-import os
-import csv
-from dotenv import load_dotenv
+"""
+date_parser.py
+--------------
+Era-aware USPTO patent date extractor.
 
-load_dotenv()
+Architecture:
+    1. era_classifier()     — routes patent to correct extractor by number + text
+    2. extract_*()          — one function per era, explicit anchors only
+    3. ExtractionResult     — standard output contract for all extractors
+    4. extract_dates()      — public entry point
 
-REFERENCE_CSV = os.getenv("REFERENCE_CSV")
-OUTPUT_CSV = os.getenv("OUTPUT_CSV_DIR")  # point this to your latest output CSV
+Era boundaries (patent number → year):
+    A   1         –  137,279   (1836–1872)  "dated" in spec line, no filing date
+    B   137,280   –  589,999   (1873–1897)  "dated" + "Application filed" same line
+    B→C 590,000   –  935,999   (1897–1909)  both "Patented" header + "dated" spec line
+    C   936,000   – 1,920,165  (1909–1933)  "Patented" own line + "Application filed"
+    D  1,920,166  – 2,924,999  (1933–1960)  "Patented" own line + "Application" no filed
+    E  2,925,000  – 3,625,113  (1960–1971)  "Filed" header + "Patented" in body
+    F  3,625,114  +             (1971–now)   INID codes [22]/[45]
 
-# =================================================
-# Update this to your latest output CSV path
-# =================================================
-LATEST_OUTPUT_CSV = os.path.join(
-    OUTPUT_CSV,
-    input(
-        "Enter your output CSV filename (e.g. patent_dates_comparison_20240101_120000.csv): "
-    ).strip(),
+Fixes in this version
+---------------------
+Fix 1 — Era F: issue = file (23 regression cases)
+    Root cause: first_date_after(idx_45) could grab the same date already
+    assigned to filing when [45] appears after [22] in the dated_lines list.
+    Fix: after pairing, if issue == filing, try the *second* date after each
+    anchor before accepting them as equal.
+
+Fix 2 — Era F: foreign priority date bleed
+    Root cause: [30] block spans multiple lines; only the code line was
+    skipped, but the bare date lines that follow were not.
+    Fix: track a "priority block active" flag that stays True until a
+    non-date, non-country, non-code line is seen after a [30]/[32] line.
+
+Fix 3 — Era F: [45] appears before [22] in OCR order
+    Root cause: positional pairing assumed [22] always precedes [45].
+    Fix: after pairing, detect the swap case (filing > issue chronologically
+    OR idx_45 < idx_22) and reassign.
+
+Fix 4 — Era E: issue_confidence = NONE (52 cases)
+    Root cause: _body_scan_issue(start_line=5) skipped lines 0-4 where
+    "Patented" appears in the one-column format header.
+    Fix: start_line=0 for Era E; deduplicate against filing date.
+
+Fix 5 — Era D: hyphenated line-break in "this applica-\ntion"
+    Root cause: sliding join produces "this applica- tion" which does not
+    match \bthis\s+application\s+.
+    Fix: dehyphenate lines before joining (collapse "word-\n word" → "word").
+"""
+
+import re
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from dateparser import parse as dateparse
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+ERA_A_END = 137_279
+ERA_B_END = 589_999
+ERA_BC_END = 935_999
+ERA_C_END = 1_920_165
+ERA_D_END = 2_924_999
+ERA_E_END = 3_625_113
+# ERA_F = everything above ERA_E_END
+
+FLEXIBLE_DATE = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
+
+# INID codes that introduce priority / related-application blocks.
+# Lines carrying these codes AND the bare-data lines that follow them
+# (dates, country names, application numbers) must all be suppressed.
+PRIORITY_CODES = frozenset(
+    ["[30]", "[32]", "[62]", "[63]", "(30)", "(32)", "(62)", "(63)"]
 )
 
-EARLY_PATENT_NUM = 137279
+
+# =============================================================================
+# OUTPUT CONTRACT
+# =============================================================================
 
 
-def normalize_patnum(patnum):
-    return str(patnum).lstrip("0")
+class Confidence(str, Enum):
+    HIGH = "HIGH"  # two anchors found and agree, or single unambiguous anchor
+    MED = "MED"  # one anchor found via primary pattern
+    LOW = "LOW"  # found via body scan / fallback
+    MISSING = "MISSING"  # structurally absent (e.g. Era A filing date)
+    NONE = "NONE"  # not found, needs review
 
 
-def normalize_date_field(val):
-    if val is None:
-        return ""
-    return str(val).strip().lstrip("0") or "0"
+@dataclass
+class ExtractionResult:
+    issue_date: Optional[str]  # MM/DD/YYYY or None
+    filing_date: Optional[str]  # MM/DD/YYYY or None
+    issue_confidence: Confidence
+    filing_confidence: Confidence
+    era: str  # "A" / "B" / "BC" / "C" / "D" / "E" / "F"
+
+    def to_parts(self):
+        """Return (iyear, imonth, iday, fyear, fmonth, fday) strings."""
+
+        def split(d):
+            if not d:
+                return "", "", ""
+            try:
+                dt = datetime.strptime(d, "%m/%d/%Y")
+                return str(dt.year), str(dt.month), str(dt.day)
+            except ValueError:
+                return "", "", ""
+
+        iy, im, id_ = split(self.issue_date)
+        fy, fm, fd = split(self.filing_date)
+        return iy, im, id_, fy, fm, fd
 
 
-def load_csv_dict(path):
-    data = {}
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            key = normalize_patnum(row["patnum"])
-            data[key] = row
-    return data
+# =============================================================================
+# SHARED UTILITIES
+# =============================================================================
 
 
-def load_output_csv(path):
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
+def normalize_text(text: str) -> str:
+    """Strip combining diacritics introduced by OCR."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    )
 
 
-# =================================================
-# LOAD DATA
-# =================================================
-print("\nLoading reference CSV...")
-reference_dict = load_csv_dict(REFERENCE_CSV)
-
-print("Loading output CSV...")
-output_rows = load_output_csv(LATEST_OUTPUT_CSV)
-
-print(f"  Reference rows : {len(reference_dict)}")
-print(f"  Output rows    : {len(output_rows)}")
+def dehyphenate(text: str) -> str:
+    """
+    Collapse OCR line-break hyphens: 'applica-\ntion' → 'application'.
+    Handles both hard hyphen and soft hyphen (U+00AD).
+    Only collapses when the hyphen is at end-of-line.
+    """
+    return re.sub(r"[-\u00ad]\s*\n\s*", "", text)
 
 
-# =================================================
-# TEST 1: Raw field value inspection
-# Prints exact bytes for each field to reveal
-# whitespace, leading zeros, type differences
-# =================================================
-print("\n" + "=" * 70)
-print("TEST 1: RAW FIELD VALUES — shows exact content including whitespace")
-print("=" * 70)
+def parse_date(raw: str) -> Optional[str]:
+    """Parse a raw date string → MM/DD/YYYY, or None if unparseable."""
+    dt = dateparse(raw)
+    if dt:
+        return dt.strftime("%m/%d/%Y")
+    return None
 
-INSPECT_PATNUMS = input(
-    "\nEnter comma-separated patnums to inspect (or press Enter to skip): "
-).strip()
 
-if INSPECT_PATNUMS:
-    for patnum in [p.strip() for p in INSPECT_PATNUMS.split(",")]:
-        key = normalize_patnum(patnum)
-        ref = reference_dict.get(key)
-        out = next(
-            (r for r in output_rows if normalize_patnum(r["patnum"]) == key), None
-        )
+def first_date_in_line(line: str) -> Optional[str]:
+    """Return the first FLEXIBLE_DATE match in a line, parsed to MM/DD/YYYY."""
+    m = re.search(FLEXIBLE_DATE, line, re.I)
+    if m:
+        return parse_date(m.group(1))
+    return None
 
-        print(f"\n--- Patent {patnum} ---")
-        if not ref:
-            print("  NOT FOUND in reference CSV")
+
+def lines(text: str):
+    """Return non-empty stripped lines."""
+    return [l.strip() for l in text.splitlines() if l.strip()]
+
+
+def _to_dt(date_str: Optional[str]) -> Optional[datetime]:
+    """MM/DD/YYYY string → datetime, or None."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%m/%d/%Y")
+    except ValueError:
+        return None
+
+
+# =============================================================================
+# ERA CLASSIFIER
+# =============================================================================
+
+
+def era_classifier(patent_num: int, text: str) -> str:
+    """
+    Return era tag: "A" | "B" | "BC" | "C" | "D" | "E" | "F"
+
+    For the E→F transition zone we sniff the text for INID codes rather
+    than relying on number alone.
+    """
+    if patent_num <= ERA_A_END:
+        return "A"
+    if patent_num <= ERA_B_END:
+        return "B"
+    if patent_num <= ERA_BC_END:
+        return "BC"
+    if patent_num <= ERA_C_END:
+        return "C"
+    if patent_num <= ERA_D_END:
+        return "D"
+    if patent_num <= ERA_E_END:
+        return "F" if _has_inid_codes(text) else "E"
+    return "F" if _has_inid_codes(text) else "E"
+
+
+def _has_inid_codes(text: str) -> bool:
+    """True if the document contains [22] and [45] INID anchors."""
+    return bool(re.search(r"\[22\]", text) and re.search(r"\[45\]", text))
+
+
+# =============================================================================
+# SHARED LAYER 2: BODY SCAN FOR ISSUE DATE
+# =============================================================================
+
+
+def _body_scan_issue(all_lines: list, start_line: int = 15) -> Optional[str]:
+    """
+    Scan body text (from start_line onward) for 'Patented Month DD, YYYY'.
+    Used as Layer 2 fallback by all eras.
+    Returns MM/DD/YYYY or None.
+    """
+    pat = rf"[Pp]atented\s+{FLEXIBLE_DATE}"
+    for line in all_lines[start_line:]:
+        m = re.search(pat, line)
+        if m:
+            return parse_date(m.group(1))
+    return None
+
+
+# =============================================================================
+# ERA EXTRACTORS
+# =============================================================================
+
+
+def _extract_era_a(all_lines: list) -> ExtractionResult:
+    """
+    Era A (1–137,279): 1836–1872
+    Issue:  'Letters Patent No. XXX, dated Month DD, YYYY'
+    Filing: structurally absent — always MISSING
+    """
+    pat = rf"[Ll]etters\s+[Pp]atent\s+No\.?\s*[\d,]+,?\s*dated\s+{FLEXIBLE_DATE}"
+
+    for line in all_lines[:30]:
+        m = re.search(pat, line)
+        if m:
+            issue = parse_date(m.group(1))
+            if issue:
+                return ExtractionResult(
+                    issue_date=issue,
+                    filing_date=None,
+                    issue_confidence=Confidence.HIGH,
+                    filing_confidence=Confidence.MISSING,
+                    era="A",
+                )
+
+    # Layer 2 fallback
+    issue = _body_scan_issue(all_lines)
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=None,
+        issue_confidence=Confidence.LOW if issue else Confidence.NONE,
+        filing_confidence=Confidence.MISSING,
+        era="A",
+    )
+
+
+def _extract_era_b(all_lines: list) -> ExtractionResult:
+    """
+    Era B (137,280–589,999): 1873–1897
+    Issue:  'dated Month DD, YYYY' in specification line
+    Filing: 'Application filed Month DD, YYYY'
+            Stop before 'Renewed' — that date is not the filing date.
+    """
+    issue_pat = rf"[Ll]etters\s+[Pp]atent\s+No\.?\s*[\d,]+,?\s*dated\s+{FLEXIBLE_DATE}"
+    filing_pat = rf"[Aa]pplication\s+filed\s+{FLEXIBLE_DATE}"
+
+    issue = None
+    filing = None
+    issue_conf = Confidence.NONE
+    filing_conf = Confidence.NONE
+
+    joined = _sliding_joins(all_lines[:40])
+
+    for line in joined:
+        if not issue:
+            m = re.search(issue_pat, line)
+            if m:
+                issue = parse_date(m.group(1))
+                issue_conf = Confidence.HIGH
+
+        if not filing:
+            clean = re.split(r"\bRenewed\b", line, flags=re.I)[0]
+            m = re.search(filing_pat, clean)
+            if m:
+                filing = parse_date(m.group(1))
+                filing_conf = Confidence.HIGH
+
+        if issue and filing:
+            break
+
+    if not issue:
+        issue = _body_scan_issue(all_lines)
+        issue_conf = Confidence.LOW if issue else Confidence.NONE
+
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=filing,
+        issue_confidence=issue_conf,
+        filing_confidence=filing_conf,
+        era="B",
+    )
+
+
+def _extract_era_bc(all_lines: list) -> ExtractionResult:
+    """
+    Era B→C (590,000–935,999): 1897–1909
+    Two issue anchors may coexist — if both found and agree → HIGH.
+    Issue:  'Patented Month DD, YYYY' header line  (newer anchor)
+            'dated Month DD, YYYY' in spec line     (older anchor)
+    Filing: 'Application filed Month DD, YYYY'
+    """
+    patented_pat = rf"[Pp]atented\s+{FLEXIBLE_DATE}"
+    dated_pat = rf"[Ll]etters\s+[Pp]atent\s+No\.?\s*[\d,]+,?\s*dated\s+{FLEXIBLE_DATE}"
+    filing_pat = rf"[Aa]pplication\s+filed\s+{FLEXIBLE_DATE}"
+
+    issue_patented = None
+    issue_dated = None
+    filing = None
+    filing_conf = Confidence.NONE
+
+    joined = _sliding_joins(all_lines[:40])
+
+    for line in joined:
+        if not issue_patented:
+            m = re.search(patented_pat, line)
+            if m:
+                issue_patented = parse_date(m.group(1))
+
+        if not issue_dated:
+            m = re.search(dated_pat, line)
+            if m:
+                issue_dated = parse_date(m.group(1))
+
+        if not filing:
+            clean = re.split(r"\bRenewed\b", line, flags=re.I)[0]
+            m = re.search(filing_pat, clean)
+            if m:
+                filing = parse_date(m.group(1))
+                filing_conf = Confidence.HIGH
+
+    if issue_patented and issue_dated:
+        if issue_patented == issue_dated:
+            issue = issue_patented
+            issue_conf = Confidence.HIGH
         else:
-            print("  REFERENCE:")
-            for field in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]:
-                val = ref.get(field)
-                print(
-                    f"    {field:8s} = [{val}]  type={type(val).__name__}  repr={repr(val)}"
-                )
+            issue = issue_patented  # prefer newer anchor
+            issue_conf = Confidence.LOW  # disagreement — flag
+    elif issue_patented:
+        issue = issue_patented
+        issue_conf = Confidence.MED
+    elif issue_dated:
+        issue = issue_dated
+        issue_conf = Confidence.MED
+    else:
+        issue = _body_scan_issue(all_lines)
+        issue_conf = Confidence.LOW if issue else Confidence.NONE
 
-        if not out:
-            print("  NOT FOUND in output CSV")
-        else:
-            print("  EXTRACTED (output CSV):")
-            for field in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]:
-                val = out.get(field)
-                print(
-                    f"    {field:8s} = [{val}]  type={type(val).__name__}  repr={repr(val)}"
-                )
-
-        if ref and out:
-            print("  FIELD-BY-FIELD COMPARISON (raw vs normalized):")
-            for field in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]:
-                rv = ref.get(field, "")
-                ov = out.get(field, "")
-                raw_match = rv == ov
-                norm_match = normalize_date_field(rv) == normalize_date_field(ov)
-                status = (
-                    "✅ MATCH"
-                    if raw_match
-                    else ("⚠️  NORM_MATCH" if norm_match else "❌ MISMATCH")
-                )
-                print(f"    {field:8s}  ref=[{rv!r:12s}]  ext=[{ov!r:12s}]  {status}")
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=filing,
+        issue_confidence=issue_conf,
+        filing_confidence=filing_conf,
+        era="BC",
+    )
 
 
-# =================================================
-# TEST 2: Find all cases where output says "No" (mismatch)
-# but raw reference values actually match extracted values
-# after normalization — these are false negatives
-# =================================================
-print("\n" + "=" * 70)
-print("TEST 2: FALSE NEGATIVES — 'No' in output but values actually match")
-print("(These are caused by leading zeros / whitespace / type differences)")
-print("=" * 70)
+def _extract_era_c(all_lines: list) -> ExtractionResult:
+    """
+    Era C (936,000–1,920,165): 1909–1933
+    Issue:  'Patented Month DD, YYYY' on its own line near top
+    Filing: 'Application filed Month DD, YYYY' on separate line
+    """
+    patented_pat = rf"[Pp]atented\s+{FLEXIBLE_DATE}"
+    filing_pat = rf"[Aa]pplication\s+filed\s+{FLEXIBLE_DATE}"
 
-false_negatives = []
+    issue = None
+    filing = None
+    issue_conf = Confidence.NONE
+    filing_conf = Confidence.NONE
 
-for row in output_rows:
-    key = normalize_patnum(row["patnum"])
-    ref = reference_dict.get(key)
-    if not ref:
-        continue
+    joined = _sliding_joins(all_lines[:40])
 
-    # Check issue date
-    if row.get("issue_date_comparison") == "No":
-        norm_match = (
-            normalize_date_field(row["iyear"]) == normalize_date_field(ref.get("iyear"))
-            and normalize_date_field(row["imonth"])
-            == normalize_date_field(ref.get("imonth"))
-            and normalize_date_field(row["iday"])
-            == normalize_date_field(ref.get("iday"))
-        )
-        if norm_match:
-            false_negatives.append(
-                {
-                    "patnum": row["patnum"],
-                    "field": "issue",
-                    "ext_year": row["iyear"],
-                    "ref_year": ref.get("iyear"),
-                    "ext_month": row["imonth"],
-                    "ref_month": ref.get("imonth"),
-                    "ext_day": row["iday"],
-                    "ref_day": ref.get("iday"),
-                }
+    for line in joined:
+        if not issue:
+            m = re.search(patented_pat, line)
+            if m:
+                issue = parse_date(m.group(1))
+                issue_conf = Confidence.HIGH
+
+        if not filing:
+            clean = re.split(r"\bRenewed\b", line, flags=re.I)[0]
+            m = re.search(filing_pat, clean)
+            if m:
+                filing = parse_date(m.group(1))
+                filing_conf = Confidence.HIGH
+
+        if issue and filing:
+            break
+
+    if not issue:
+        issue = _body_scan_issue(all_lines)
+        issue_conf = Confidence.LOW if issue else Confidence.NONE
+
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=filing,
+        issue_confidence=issue_conf,
+        filing_confidence=filing_conf,
+        era="C",
+    )
+
+
+def _extract_era_d(all_lines: list) -> ExtractionResult:
+    """
+    Era D (1,920,166–2,924,999): 1933–1960
+    Issue:  'Patented Month DD, YYYY'
+    Filing: 'Application Month DD, YYYY' — NO 'filed' keyword
+    Divided apps: 'Original application ...' then 'this application ...'
+                  Use 'this application' date.
+
+    Fix 5: dehyphenate raw text before building line list so that
+    'applica-\\ntion' collapses to 'application' before regex matching.
+    The dehyphenation is applied in extract_dates() before passing
+    all_lines here, so no change is needed in this function itself.
+    """
+    patented_pat = rf"[Pp]atented\s+{FLEXIBLE_DATE}"
+    filing_primary = rf"\bApplication\s+{FLEXIBLE_DATE}"
+    filing_divided = rf"\bthis\s+application\s+{FLEXIBLE_DATE}"
+    original_pat = r"[Oo]riginal\s+application"
+
+    issue = None
+    filing = None
+    issue_conf = Confidence.NONE
+    filing_conf = Confidence.NONE
+
+    joined = _sliding_joins(all_lines[:50])
+
+    for line in joined:
+        if not issue:
+            m = re.search(patented_pat, line)
+            if m:
+                issue = parse_date(m.group(1))
+                issue_conf = Confidence.HIGH
+
+        if not filing:
+            m = re.search(filing_divided, line, re.I)
+            if m:
+                filing = parse_date(m.group(1))
+                filing_conf = Confidence.HIGH
+                continue
+
+            if re.search(original_pat, line, re.I):
+                continue
+
+            m = re.search(filing_primary, line, re.I)
+            if m:
+                filing = parse_date(m.group(1))
+                filing_conf = Confidence.HIGH
+
+        if issue and filing:
+            break
+
+    if not issue:
+        issue = _body_scan_issue(all_lines)
+        issue_conf = Confidence.LOW if issue else Confidence.NONE
+
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=filing,
+        issue_confidence=issue_conf,
+        filing_confidence=filing_conf,
+        era="D",
+    )
+
+
+def _extract_era_e(all_lines: list) -> ExtractionResult:
+    """
+    Era E (2,925,000–3,625,113): 1960–1971
+
+    One-column format (early E, ~1960–1965):
+        Header line 1-3:  'Patented Month DD, YYYY'  (issue, appears very early)
+        Body:             'Filed Month DD, YYYY, Ser. No.' (filing)
+
+    Two-column format (late E, ~1965–1971):
+        Header:  'Filed Month DD, YYYY, Ser. No.' (filing, first 30 lines)
+        Body:    'Patented Month DD, YYYY' (issue, anywhere from line 0 onward)
+
+    Fix 4: start body scan at line 0 (not 5) to catch 'Patented' in the
+    one-column header. Deduplicate: if the body scan finds the same date
+    as filing, discard it (it's the filing date leaking, not the issue date).
+
+    Divided apps: same 'this application' logic as Era D.
+    """
+    filing_pat_e = rf"\bFiled\s+{FLEXIBLE_DATE}"
+    filing_pat_d = rf"\bApplication\s+{FLEXIBLE_DATE}"
+    filing_divided = rf"\bthis\s+application\s+{FLEXIBLE_DATE}"
+    original_pat = r"[Oo]riginal\s+application"
+
+    filing = None
+    filing_conf = Confidence.NONE
+
+    header = _sliding_joins(all_lines[:30])
+
+    for line in header:
+        if filing:
+            break
+
+        m = re.search(filing_divided, line, re.I)
+        if m:
+            filing = parse_date(m.group(1))
+            filing_conf = Confidence.HIGH
+            break
+
+        if re.search(original_pat, line, re.I):
+            continue
+
+        m = re.search(filing_pat_e, line, re.I)
+        if m:
+            filing = parse_date(m.group(1))
+            filing_conf = Confidence.HIGH
+            break
+
+    if not filing:
+        for line in header:
+            if re.search(original_pat, line, re.I):
+                continue
+            m = re.search(filing_pat_d, line, re.I)
+            if m:
+                filing = parse_date(m.group(1))
+                filing_conf = Confidence.MED
+                break
+
+    # Fix 4: scan from line 0 to catch one-column format
+    issue = _body_scan_issue(all_lines, start_line=0)
+
+    # Deduplicate: body scan must not return the same date as filing
+    if issue and issue == filing:
+        issue = _body_scan_issue_skip(all_lines, skip_date=filing)
+
+    issue_conf = Confidence.MED if issue else Confidence.NONE
+
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=filing,
+        issue_confidence=issue_conf,
+        filing_confidence=filing_conf,
+        era="E",
+    )
+
+
+def _body_scan_issue_skip(all_lines: list, skip_date: Optional[str]) -> Optional[str]:
+    """
+    Like _body_scan_issue but skips any occurrence of skip_date.
+    Used by Era E to avoid returning the filing date as the issue date.
+    """
+    pat = rf"[Pp]atented\s+{FLEXIBLE_DATE}"
+    for line in all_lines:
+        m = re.search(pat, line)
+        if m:
+            candidate = parse_date(m.group(1))
+            if candidate and candidate != skip_date:
+                return candidate
+    return None
+
+
+def _extract_era_f(all_lines: list) -> ExtractionResult:
+    """
+    Era F (3,625,114+): 1971–present
+    Issue:  [45] INID code
+    Filing: [22] INID code
+    All [30]/[32]/[62]/[63] priority lines AND their following data lines
+    are completely ignored.
+
+    Fix 1 — issue = file:
+        After pairing, if issue == filing, try assigning the *next distinct*
+        date for each anchor before accepting them as identical.
+
+    Fix 2 — foreign priority date bleed:
+        Track a priority_block flag.  Once a line containing a priority INID
+        code is seen, all subsequent lines that look like bare dates, country
+        names, or application numbers are also suppressed — until a structural
+        line (containing another INID code, a known keyword, or clearly not
+        priority data) resets the flag.
+
+    Fix 3 — [45] before [22] in OCR order:
+        After pairing, if idx_45 < idx_22 (OCR column reversal), swap the
+        assigned dates back.  Chronological sanity check is kept as secondary
+        guard.
+    """
+    HEADER_LINES = 80
+
+    # Lines that signal "this line and the next N lines are priority data"
+    PRIORITY_START = re.compile(r"\[3[02]\]|\(3[02]\)|\[6[23]\]|\(6[23]\)", re.I)
+    # A line looks like priority follow-on data if it is:
+    #   - a bare date (matches FLEXIBLE_DATE with nothing else substantial)
+    #   - a country name (letters only, short)
+    #   - an application number (digits / slashes only)
+    PRIORITY_FOLLOWON = re.compile(
+        r"^(?:"
+        r"[A-Za-z]{2,30}"  # country name
+        r"|[\d,/\.\-]+"  # application number
+        r"|"
+        + FLEXIBLE_DATE[1:-1]  # bare date (strip outer parens)
+        + r")\s*$",
+        re.I,
+    )
+
+    def is_priority_line(line: str, in_block: bool) -> tuple:
+        """Return (should_skip, new_in_block)."""
+        if PRIORITY_START.search(line):
+            return True, True
+        if in_block:
+            if PRIORITY_FOLLOWON.match(line):
+                return True, True
+            # Any other content — reset block
+            return False, False
+        return False, False
+
+    header = all_lines[:HEADER_LINES]
+
+    # --- Step 1: find anchor line indices, respecting priority blocks ---
+    idx_22 = None
+    idx_45 = None
+    in_prio = False
+
+    for i, line in enumerate(header):
+        skip, in_prio = is_priority_line(line, in_prio)
+        if skip:
+            continue
+        if idx_22 is None and ("[22]" in line or "(22)" in line):
+            idx_22 = i
+        if idx_45 is None and ("[45]" in line or "(45)" in line):
+            idx_45 = i
+
+    # --- Step 2: collect all dated lines, respecting priority blocks ---
+    dated_lines = []
+    in_prio = False
+    for i, line in enumerate(header):
+        skip, in_prio = is_priority_line(line, in_prio)
+        if skip:
+            continue
+        d = first_date_in_line(line)
+        if d:
+            dated_lines.append((i, d))
+
+    # --- Step 3: pair by position ---
+    def dates_after(anchor_idx: Optional[int]) -> list:
+        """All dates on lines >= anchor_idx, in order."""
+        if anchor_idx is None:
+            return []
+        return [date for line_idx, date in dated_lines if line_idx >= anchor_idx]
+
+    filing_candidates = dates_after(idx_22)
+    issue_candidates = dates_after(idx_45)
+
+    filing = filing_candidates[0] if filing_candidates else None
+    issue = issue_candidates[0] if issue_candidates else None
+
+    # Fix 1: if pairing produced the same date, try next candidates
+    if issue and filing and issue == filing:
+        # Try second candidate for each
+        alt_issue = issue_candidates[1] if len(issue_candidates) > 1 else None
+        alt_filing = filing_candidates[1] if len(filing_candidates) > 1 else None
+
+        if alt_issue and alt_issue != filing:
+            issue = alt_issue
+        elif alt_filing and alt_filing != issue:
+            filing = alt_filing
+        # If still equal, leave as-is (genuinely same date; anomaly detector handles it)
+
+    # Fix 3: swap if [45] appeared before [22] in OCR (column-reversal)
+    if issue and filing and idx_22 is not None and idx_45 is not None:
+        if idx_45 < idx_22:
+            issue, filing = filing, issue
+
+    # Chronological sanity: issue must be >= filing
+    dt_issue = _to_dt(issue)
+    dt_filing = _to_dt(filing)
+    if dt_issue and dt_filing and dt_filing > dt_issue:
+        issue, filing = filing, issue
+
+    issue_conf = Confidence.HIGH if issue else Confidence.NONE
+    filing_conf = Confidence.HIGH if filing else Confidence.NONE
+
+    # Layer 2 fallback for issue only
+    if not issue:
+        issue = _body_scan_issue(all_lines)
+        issue_conf = Confidence.LOW if issue else Confidence.NONE
+
+    return ExtractionResult(
+        issue_date=issue,
+        filing_date=filing,
+        issue_confidence=issue_conf,
+        filing_confidence=filing_conf,
+        era="F",
+    )
+
+
+# =============================================================================
+# SLIDING JOIN HELPER
+# =============================================================================
+
+
+def _sliding_joins(line_list: list) -> list:
+    """
+    Yield single lines plus 2-line and 3-line joins.
+    Handles OCR line splits without global combinatorial explosion.
+    """
+    result = []
+    n = len(line_list)
+    for i in range(n):
+        result.append(line_list[i])
+        if i + 1 < n:
+            result.append(line_list[i] + " " + line_list[i + 1])
+        if i + 2 < n:
+            result.append(
+                line_list[i] + " " + line_list[i + 1] + " " + line_list[i + 2]
             )
-
-    # Check filing date
-    if row.get("filing_date_comparison") == "No":
-        norm_match = (
-            normalize_date_field(row["fyear"]) == normalize_date_field(ref.get("fyear"))
-            and normalize_date_field(row["fmonth"])
-            == normalize_date_field(ref.get("fmonth"))
-            and normalize_date_field(row["fday"])
-            == normalize_date_field(ref.get("fday"))
-        )
-        if norm_match:
-            false_negatives.append(
-                {
-                    "patnum": row["patnum"],
-                    "field": "filing",
-                    "ext_year": row["fyear"],
-                    "ref_year": ref.get("fyear"),
-                    "ext_month": row["fmonth"],
-                    "ref_month": ref.get("fmonth"),
-                    "ext_day": row["fday"],
-                    "ref_day": ref.get("fday"),
-                }
-            )
-
-if false_negatives:
-    print(f"\nFound {len(false_negatives)} false negative(s):\n")
-    for fn in false_negatives:
-        print(f"  Patent {fn['patnum']} [{fn['field']}]")
-        print(f"    year  : ext=[{fn['ext_year']!r}]  ref=[{fn['ref_year']!r}]")
-        print(f"    month : ext=[{fn['ext_month']!r}]  ref=[{fn['ref_month']!r}]")
-        print(f"    day   : ext=[{fn['ext_day']!r}]  ref=[{fn['ref_day']!r}]")
-else:
-    print("\n  ✅ No false negatives found — comparisons look accurate.")
+    return result
 
 
-# =================================================
-# TEST 3: Leading zero audit across entire reference CSV
-# Shows how many reference fields have leading zeros
-# so you know how widespread the issue is
-# =================================================
-print("\n" + "=" * 70)
-print("TEST 3: LEADING ZERO AUDIT — reference CSV field format")
-print("=" * 70)
-
-leading_zero_counts = {
-    f: 0 for f in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]
-}
-non_empty_counts = {
-    f: 0 for f in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]
-}
-
-for ref in reference_dict.values():
-    for field in leading_zero_counts:
-        val = ref.get(field, "")
-        if val and str(val).strip():
-            non_empty_counts[field] += 1
-            if str(val).strip().startswith("0"):
-                leading_zero_counts[field] += 1
-
-print(
-    f"\n  {'Field':8s}  {'Has leading zero':>20s}  {'Total non-empty':>16s}  {'% affected':>12s}"
-)
-print(f"  {'-' * 8}  {'-' * 20}  {'-' * 16}  {'-' * 12}")
-for field in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]:
-    total = non_empty_counts[field]
-    zeros = leading_zero_counts[field]
-    pct = f"{zeros / total * 100:.1f}%" if total else "N/A"
-    flag = " ⚠️" if zeros > 0 else " ✅"
-    print(f"  {field:8s}  {zeros:>20d}  {total:>16d}  {pct:>12s}{flag}")
+# =============================================================================
+# PUBLIC ENTRY POINT
+# =============================================================================
 
 
-# =================================================
-# TEST 4: Whitespace audit — check for trailing/leading spaces
-# =================================================
-print("\n" + "=" * 70)
-print("TEST 4: WHITESPACE AUDIT — reference CSV fields with spaces")
-print("=" * 70)
+def extract_dates(text: str, patent_num: int) -> ExtractionResult:
+    """
+    Main entry point.
 
-whitespace_found = False
-for key, ref in reference_dict.items():
-    for field in ["iyear", "imonth", "iday", "fyear", "fmonth", "fday"]:
-        val = ref.get(field, "")
-        if val and val != val.strip():
-            print(f"  ⚠️  Patent {key} field [{field}] has whitespace: {val!r}")
-            whitespace_found = True
+    Args:
+        text:       Raw OCR text of the patent document.
+        patent_num: Integer patent number (no leading zeros).
 
-if not whitespace_found:
-    print("  ✅ No whitespace issues found in reference CSV.")
+    Returns:
+        ExtractionResult with dates, confidence levels, and era tag.
+    """
+    text = normalize_text(text)
+    # Fix 5: dehyphenate before splitting into lines so that line-break
+    # hyphens (e.g. 'applica-\ntion') are collapsed before regex matching.
+    text = dehyphenate(text)
+    all_lines = lines(text)
+    era = era_classifier(patent_num, text)
 
+    extractors = {
+        "A": _extract_era_a,
+        "B": _extract_era_b,
+        "BC": _extract_era_bc,
+        "C": _extract_era_c,
+        "D": _extract_era_d,
+        "E": _extract_era_e,
+        "F": _extract_era_f,
+    }
 
-# =================================================
-# SUMMARY
-# =================================================
-print("\n" + "=" * 70)
-print("SUMMARY")
-print("=" * 70)
-issue_no_count = sum(1 for r in output_rows if r.get("issue_date_comparison") == "No")
-filing_no_count = sum(1 for r in output_rows if r.get("filing_date_comparison") == "No")
-total_fn = len(false_negatives)
-issue_fn_count = sum(1 for fn in false_negatives if fn["field"] == "issue")
-filing_fn_count = sum(1 for fn in false_negatives if fn["field"] == "filing")
-
-print(f"  Total 'No' in issue_date_comparison  : {issue_no_count}")
-print(f"  Total 'No' in filing_date_comparison : {filing_no_count}")
-print(
-    f"  False negatives (norm fixes)         : {total_fn}  (issue={issue_fn_count}, filing={filing_fn_count})"
-)
-if total_fn > 0:
-    print(f"\n  ⚠️  Apply normalize_date_field() fix to compare_dates_with_flags()")
-    print(f"     to convert {total_fn} false mismatches to correct matches.")
-else:
-    print(f"\n  ✅ Comparison logic appears correct — mismatches are genuine.")
-print()
+    return extractors[era](all_lines)

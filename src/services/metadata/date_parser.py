@@ -33,12 +33,13 @@ from dateparser import parse as dateparse
 # CONSTANTS
 # =============================================================================
 
-ERA_A_END = 134_503
+ERA_A_END = 137_279
 ERA_B_END = 589_999
 ERA_BC_END = 935_999
-ERA_C_END = 1_919_999
+ERA_C_END = 1_920_165
 ERA_D_END = 2_924_999
-ERA_E_END = 3_649_999
+ERA_E_END = 3_625_113
+
 # ERA_F = everything above ERA_E_END
 
 FLEXIBLE_DATE = r"([A-Za-z]{3,9}\.?\s+\d{1,2},?\s*\d{4})"
