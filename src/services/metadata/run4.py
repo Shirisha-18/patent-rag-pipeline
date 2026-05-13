@@ -1,14 +1,15 @@
 """
 run.py
-------
-Orchestration layer — unchanged in structure from previous version.
+---------
+Orchestration layer. Replaces the old run() function.
 
-Changes for date5.py:
-    - Imports from date5 instead of date4
-    - ExtractionResult no longer has .issue_confidence / .filing_confidence
-      — replaced by .issue_pass / .filing_pass (mechanistic tags)
-    - Output CSV gains two new columns: issue_pass, filing_pass
-    - compare() updated to use the new pass tag field names
+Responsibilities:
+    1. Walk OCR folders, call extract_dates() per patent
+    2. Compare extracted dates against reference CSV
+    3. Apply anomaly detection (monotonicity, sanity checks)
+    4. Write output CSV
+
+Intentionally thin — no date parsing logic lives here.
 """
 
 import csv
@@ -16,11 +17,11 @@ import os
 from datetime import datetime
 from typing import Optional
 
+from dateparser import parse as dateparse
 from dotenv import load_dotenv
 
-from date_parser import (
-    PASS_MISSING,
-    PASS_NONE,
+from date4 import (
+    Confidence,
     ExtractionResult,
     extract_dates,
 )
@@ -47,8 +48,8 @@ OUTPUT_FIELDS = [
     "fyear",
     "fmonth",
     "fday",
-    "issue_pass",
-    "filing_pass",
+    "issue_confidence",
+    "filing_confidence",
     "issue_date_comparison",
     "filing_date_comparison",
     "validation_result",
@@ -102,17 +103,19 @@ def compare(result: ExtractionResult, ref: Optional[dict], patnum_int: int) -> t
     Returns (issue_status, filing_status, validation_result).
 
     Statuses:
-        "Yes"                  — matches reference
-        "No"                   — does not match
-        "Missing in reference" — reference has no value to compare against
-        "Missing in patent"    — structurally absent (Era A filing)
+        "Yes"                 — matches reference
+        "No"                  — does not match
+        "Missing in reference"— reference has no value to compare against
+        "Missing in patent"   — structurally absent (Era A filing)
     """
     if not ref:
         return "Missing in reference", "Missing in reference", "Wrong"
 
     iy, im, id_, fy, fm, fd = result.to_parts()
+
     extracted_issue = (iy, im, id_)
     extracted_filing = (fy, fm, fd)
+
     ref_issue = (ref.get("iyear", ""), ref.get("imonth", ""), ref.get("iday", ""))
     ref_filing = (ref.get("fyear", ""), ref.get("fmonth", ""), ref.get("fday", ""))
 
@@ -128,7 +131,7 @@ def compare(result: ExtractionResult, ref: Optional[dict], patnum_int: int) -> t
         issue_status = "No"
 
     # Filing
-    if result.filing_pass == PASS_MISSING:
+    if result.filing_confidence == Confidence.MISSING:
         filing_status = "Missing in patent"
     elif not has_value(ref_filing):
         filing_status = "Missing in reference"
@@ -154,8 +157,8 @@ def compare(result: ExtractionResult, ref: Optional[dict], patnum_int: int) -> t
 # ANOMALY DETECTION
 # =============================================================================
 
-EARLIEST_VALID_DATE = datetime(1836, 7, 13)
-FILING_ERA_START = datetime(1873, 4, 1)
+EARLIEST_VALID_DATE = datetime(1836, 7, 13)  # first modern USPTO patent
+FILING_ERA_START = datetime(1873, 4, 1)  # filing dates begin ~Era B
 
 
 def detect_anomaly(
@@ -163,6 +166,15 @@ def detect_anomaly(
     patnum_int: int,
     previous_issue_dt: Optional[datetime],
 ) -> str:
+    """
+    Returns anomaly flag string or "OK".
+
+    Checks (in priority order):
+        1. issue = filing date (same day — almost always wrong)
+        2. issue before previous issue (monotonicity violation)
+        3. issue before historical floor
+        4. issue before filing date
+    """
     iy, im, id_, fy, fm, fd = result.to_parts()
     issue_dt = safe_date(iy, im, id_)
     filing_dt = safe_date(fy, fm, fd)
@@ -170,17 +182,21 @@ def detect_anomaly(
     if not issue_dt:
         return "OK"
 
-    filing_absent = result.filing_pass == PASS_MISSING
+    filing_absent = result.filing_confidence == Confidence.MISSING
 
+    # 1. issue = filing
     if not filing_absent and filing_dt and issue_dt == filing_dt:
         return "issue = file"
 
+    # 2. monotonicity
     if previous_issue_dt and issue_dt < previous_issue_dt:
         return "issue < previous issue"
 
+    # 3. historical floor
     if issue_dt < EARLIEST_VALID_DATE:
         return "old patent"
 
+    # 4. issue before filing
     if (
         not filing_absent
         and filing_dt
@@ -232,6 +248,7 @@ def run():
         issue_comp, filing_comp, validation = compare(result, ref, patnum_int)
         anomaly = detect_anomaly(result, patnum_int, previous_issue_dt)
 
+        # Advance monotonicity tracker
         issue_dt = safe_date(iy, im, id_)
         if issue_dt:
             previous_issue_dt = issue_dt
@@ -246,8 +263,8 @@ def run():
                 "fyear": fy,
                 "fmonth": fm,
                 "fday": fd,
-                "issue_pass": result.issue_pass,
-                "filing_pass": result.filing_pass,
+                "issue_confidence": result.issue_confidence.value,
+                "filing_confidence": result.filing_confidence.value,
                 "issue_date_comparison": issue_comp,
                 "filing_date_comparison": filing_comp,
                 "validation_result": validation,
@@ -257,8 +274,8 @@ def run():
 
         print(
             f"[{result.era}] {folder} | "
-            f"Issue: {result.issue_date or 'N/A'} ({result.issue_pass}) | "
-            f"Filed: {result.filing_date or 'N/A'} ({result.filing_pass}) | "
+            f"Issue: {result.issue_date or 'N/A'} ({result.issue_confidence.value}) | "
+            f"Filed: {result.filing_date or 'N/A'} ({result.filing_confidence.value}) | "
             f"{validation} | {anomaly}"
         )
 
@@ -267,9 +284,9 @@ def run():
             writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
             writer.writeheader()
             writer.writerows(rows)
-        print(f"\n✅  Done. {len(rows)} patents written to:\n{OUTPUT_CSV}")
+        print(f"\n✅ Done. {len(rows)} patents written to:\n{OUTPUT_CSV}")
     else:
-        print("⚠️   No rows produced — check OCR_ROOT path.")
+        print("⚠️  No rows produced — check OCR_ROOT path.")
 
 
 if __name__ == "__main__":
